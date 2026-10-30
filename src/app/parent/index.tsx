@@ -29,6 +29,8 @@ const AVAILABLE_TIMES = [
 
 const JS_DAYS_MAP = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'];
 
+const PLATFORM_COMMISSION_RATE = 0.30; // 30% comisión MVP
+
 const showAlert = (title: string, message: string) => {
   if (Platform.OS === 'web') {
     alert(title + ': ' + message);
@@ -37,9 +39,23 @@ const showAlert = (title: string, message: string) => {
   }
 };
 
+const formatCLP = (amount: number | string) => {
+  const num = Number(amount) || 0;
+  return '$' + new Intl.NumberFormat('es-CL').format(Math.round(num)) + ' CLP';
+};
+
 const timeToMinutes = (timeStr: string) => {
   const [hours, minutes] = timeStr.split(':').map(Number);
   return hours * 60 + minutes;
+};
+
+// Extrae la cantidad de horas desde un string "09:00 - 11:30" -> 2.5
+const getHoursFromTimeRange = (jobTime?: string) => {
+  if (!jobTime) return 2;
+  const parts = jobTime.split('-').map(s => s.trim());
+  if (parts.length !== 2) return 2;
+  const diffMins = timeToMinutes(parts[1]) - timeToMinutes(parts[0]);
+  return diffMins > 0 ? diffMins / 60 : 2;
 };
 
 // Genera los próximos 14 días cruzados con la disponibilidad de la niñera
@@ -52,7 +68,7 @@ const getUpcoming14Days = (allowedDays?: string[]) => {
     d.setDate(today.getDate() + i);
     const dayName = JS_DAYS_MAP[d.getDay()];
 
-    if ( Array.isArray(allowedDays) && allowedDays.length > 0 && !allowedDays.includes(dayName) ) {
+    if (Array.isArray(allowedDays) && allowedDays.length > 0 && !allowedDays.includes(dayName)) {
       continue;
     }
 
@@ -111,6 +127,10 @@ export default function ParentHomeScreen() {
   const [modalDay, setModalDay] = useState<string>('');
   const [modalStartTime, setModalStartTime] = useState<string>('09:00');
   const [modalEndTime, setModalEndTime] = useState<string>('11:00');
+  const [showModalPriceBreakdown, setShowModalPriceBreakdown] = useState<boolean>(false);
+
+  // Estado para expandir/contraer el detalle de cobro en tarjetas activas e historial
+  const [expandedBreakdownIds, setExpandedBreakdownIds] = useState<{ [key: string]: boolean }>({});
 
   const [reviewingSitter, setReviewingSitter] = useState<any | null>(null);
   const [reviewRating, setReviewRating] = useState<number>(5);
@@ -135,6 +155,11 @@ export default function ParentHomeScreen() {
     emergency_contact: ''
   });
   const [profileLoading, setProfileLoading] = useState(false);
+  const [profileSaveSuccess, setProfileSaveSuccess] = useState(false);
+
+  const toggleBreakdown = (id: string) => {
+    setExpandedBreakdownIds(prev => ({ ...prev, [id]: !prev[id] }));
+  };
 
   useEffect(() => {
     let reqSubscription: any = null;
@@ -330,7 +355,7 @@ export default function ParentHomeScreen() {
       if (!user) return;
       const { data, error } = await supabase
         .from('job_requests')
-        .select('id, babysitter_id, status, job_date, job_time')
+        .select('id, babysitter_id, status, job_date, job_time, total_amount, platform_fee, babysitter_payout, payment_status')
         .eq('parent_id', user.id)
         .in('status', ['pending', 'accepted']);
       if (error) throw error;
@@ -394,6 +419,7 @@ export default function ParentHomeScreen() {
 
   const handleOpenSitterModal = (sitter: any) => {
     setSelectedSitter(sitter);
+    setShowModalPriceBreakdown(false);
     const upcomingDates = getUpcoming14Days(sitter.available_days);
     setModalDateOptions(upcomingDates);
 
@@ -430,6 +456,12 @@ export default function ParentHomeScreen() {
       return;
     }
 
+    const durationHours = (endMins - startMins) / 60;
+    const hourlyRate = Number(selectedSitter?.hourly_rate) || 10000;
+    const totalAmount = Math.round(durationHours * hourlyRate);
+    const platformFee = Math.round(totalAmount * PLATFORM_COMMISSION_RATE);
+    const babysitterPayout = totalAmount - platformFee;
+
     const timeRangeString = modalStartTime + " - " + modalEndTime;
 
     setRequestingId(babysitterId);
@@ -449,7 +481,11 @@ export default function ParentHomeScreen() {
       const jobDetails = {
         status: 'pending',
         job_date: modalDay,
-        job_time: timeRangeString
+        job_time: timeRangeString,
+        total_amount: totalAmount,
+        platform_fee: platformFee,
+        babysitter_payout: babysitterPayout,
+        payment_status: 'unpaid'
       };
 
       if (existingReq) {
@@ -464,11 +500,14 @@ export default function ParentHomeScreen() {
         if (insertError) throw insertError;
       }
 
-      showAlert("¡Solicitud enviada!", "Has solicitado a esta niñera para el " + modalDay + " de " + timeRangeString + ".");
+      showAlert(
+        "¡Solicitud enviada!",
+        "Has solicitado a esta niñera para el " + modalDay + " de " + timeRangeString + ".\nTotal estimado: " + formatCLP(totalAmount)
+      );
       loadMyRequests();
       setSelectedSitter(null);
       
-      await sendNotificationToSitter(babysitterId, "Nueva Solicitud", "Un padre te ha enviado una solicitud de trabajo para el " + modalDay + ".");
+      await sendNotificationToSitter(babysitterId, "Nueva Solicitud", "Un padre te ha enviado una solicitud de trabajo para el " + modalDay + " (" + formatCLP(babysitterPayout) + " líquidos).");
 
     } catch (error: any) {
       showAlert("Error", error.message);
@@ -483,15 +522,18 @@ export default function ParentHomeScreen() {
       if (!user) return;
       const { error } = await supabase
         .from('job_requests')
-        .update({ status: 'completed' })
+        .update({ 
+          status: 'completed',
+          payment_status: 'ready_for_payout'
+        })
         .eq('parent_id', user.id)
         .eq('babysitter_id', babysitterId);
       if (error) throw error;
       setMyRequests(prev => { const copy = { ...prev }; delete copy[babysitterId]; return copy; });
       loadHistoryRequests();
-      showAlert("¡Servicio completado!", "Ahora puedes calificar la atención en tu historial.");
+      showAlert("¡Servicio completado!", "El pago ha pasado a liberación y ahora puedes calificar la atención en tu historial.");
 
-      await sendNotificationToSitter(babysitterId, "Trabajo Completado", "El padre ha marcado el servicio como completado. ¡Buen trabajo!");
+      await sendNotificationToSitter(babysitterId, "Trabajo Completado", "El padre ha marcado el servicio como completado y tu pago está listo para liquidación. ¡Buen trabajo!");
 
     } catch (error: any) {
       showAlert("Error", error.message);
@@ -607,6 +649,7 @@ export default function ParentHomeScreen() {
 
   const handleSaveProfile = async () => {
     setProfileLoading(true);
+    setProfileSaveSuccess(false);
     try {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) throw new Error("No hay sesión activa");
@@ -622,7 +665,8 @@ export default function ParentHomeScreen() {
 
       const { error } = await supabase.from('parent_profiles').upsert(updates);
       if (error) throw error;
-      showAlert("Éxito", "Tu perfil ha sido actualizado correctamente.");
+      setProfileSaveSuccess(true);
+      setTimeout(() => setProfileSaveSuccess(false), 3000);
     } catch (error: any) {
       showAlert("Error", error.message);
     } finally {
@@ -642,6 +686,28 @@ export default function ParentHomeScreen() {
   );
 
   const unreadNotificationsCount = notifications.filter(n => !n.is_read).length;
+
+  // Cálculos en vivo para el modal de solicitud
+  const modalDurationHours = Math.max(2, (timeToMinutes(modalEndTime) - timeToMinutes(modalStartTime)) / 60);
+  const modalHourlyRate = Number(selectedSitter?.hourly_rate) || 10000;
+  const modalTotalAmount = Math.round(modalDurationHours * modalHourlyRate);
+  const modalPlatformFee = Math.round(modalTotalAmount * PLATFORM_COMMISSION_RATE);
+  const modalSitterNet = modalTotalAmount - modalPlatformFee;
+
+  const getPaymentStatusBadge = (paymentStatus?: string) => {
+    switch (paymentStatus) {
+      case 'held':
+        return { label: '🔒 Pago Retenido en Garantía (Escrow)', color: '#c05621', bg: '#feebc8' };
+      case 'ready_for_payout':
+        return { label: '⏳ En proceso de liberación a niñera', color: '#2b6cb0', bg: '#ebf8ff' };
+      case 'paid_out':
+        return { label: '✅ Liquidado a la niñera', color: '#22543d', bg: '#c6f6d5' };
+      case 'refunded':
+        return { label: '↩️ Reembolsado', color: '#718096', bg: '#edf2f7' };
+      default:
+        return { label: '💳 Pendiente de cobro / retención', color: '#744210', bg: '#fefcbf' };
+    }
+  };
 
   return (
     <View style={styles.mainWrapper}>
@@ -728,6 +794,15 @@ export default function ParentHomeScreen() {
                   const rawPhone = sitter.phone_number || sitter.phone || sitter.telefono || "";
                   const ratingLabel = sitter.rating ? Number(sitter.rating).toFixed(1) : 'Nuevo';
 
+                  // Datos financieros de la solicitud activa (si existe)
+                  const reqHours = getHoursFromTimeRange(reqData?.job_time);
+                  const reqRate = Number(sitter.hourly_rate) || 10000;
+                  const reqTotal = Number(reqData?.total_amount) || Math.round(reqHours * reqRate);
+                  const reqFee = Number(reqData?.platform_fee) || Math.round(reqTotal * PLATFORM_COMMISSION_RATE);
+                  const reqNet = Number(reqData?.babysitter_payout) || (reqTotal - reqFee);
+                  const isExpanded = Boolean(reqData?.id && expandedBreakdownIds[reqData.id]);
+                  const payBadge = getPaymentStatusBadge(reqData?.payment_status);
+
                   return (
                     <View key={sitter.id} style={styles.card}>
                       <TouchableOpacity activeOpacity={0.7} onPress={() => handleOpenSitterModal(sitter)}>
@@ -755,7 +830,7 @@ export default function ParentHomeScreen() {
                       </TouchableOpacity>
                       
                       <View style={styles.cardFooter}>
-                        <Text style={styles.cardRate}>${sitter.hourly_rate}/hr</Text>
+                        <Text style={styles.cardRate}>{formatCLP(sitter.hourly_rate)}/hr</Text>
                         <Text style={styles.cardExp}>⭐ {sitter.experience_years} años exp.</Text>
                       </View>
 
@@ -775,6 +850,49 @@ export default function ParentHomeScreen() {
                               Agendado para el <Text style={{ fontWeight: 'bold' }}>{reqData?.job_date || 'día indicado'}</Text> de <Text style={{ fontWeight: 'bold' }}>{reqData?.job_time || 'horario indicado'}</Text>.
                             </Text>
                           </View>
+
+                          {/* BOTÓN EXPANDIBLE DE DESGLOSE DE PAGO */}
+                          <TouchableOpacity 
+                            style={styles.breakdownToggleBtn} 
+                            onPress={() => reqData?.id && toggleBreakdown(reqData.id)}
+                          >
+                            <Text style={styles.breakdownToggleText}>
+                              💳 Total a Pagar: {formatCLP(reqTotal)}
+                            </Text>
+                            <Text style={styles.breakdownToggleArrow}>
+                              {isExpanded ? 'Ocultar detalle ▲' : 'Ver detalle ▼'}
+                            </Text>
+                          </TouchableOpacity>
+
+                          {isExpanded && (
+                            <View style={styles.breakdownCard}>
+                              <View style={styles.breakdownRow}>
+                                <Text style={styles.breakdownLabel}>Tarifa por hora:</Text>
+                                <Text style={styles.breakdownValue}>{formatCLP(reqRate)}</Text>
+                              </View>
+                              <View style={styles.breakdownRow}>
+                                <Text style={styles.breakdownLabel}>Duración agendada:</Text>
+                                <Text style={styles.breakdownValue}>{reqHours} hrs ({reqData?.job_time})</Text>
+                              </View>
+                              <View style={styles.breakdownDivider} />
+                              <View style={styles.breakdownRow}>
+                                <Text style={styles.breakdownLabel}>Pago líquido a {sitter.first_name} (70%):</Text>
+                                <Text style={styles.breakdownValue}>{formatCLP(reqNet)}</Text>
+                              </View>
+                              <View style={styles.breakdownRow}>
+                                <Text style={styles.breakdownLabel}>Comisión y Garantía App (30%):</Text>
+                                <Text style={styles.breakdownValue}>{formatCLP(reqFee)}</Text>
+                              </View>
+                              <View style={styles.breakdownDivider} />
+                              <View style={styles.breakdownRow}>
+                                <Text style={styles.breakdownTotalLabel}>Total del Servicio:</Text>
+                                <Text style={styles.breakdownTotalValue}>{formatCLP(reqTotal)}</Text>
+                              </View>
+                              <View style={[styles.paymentStatusPill, { backgroundColor: payBadge.bg }]}>
+                                <Text style={[styles.paymentStatusPillText, { color: payBadge.color }]}>{payBadge.label}</Text>
+                              </View>
+                            </View>
+                          )}
 
                           <TouchableOpacity 
                             style={styles.chatAppButton} 
@@ -808,8 +926,39 @@ export default function ParentHomeScreen() {
                       ) : requestStatus === 'pending' ? (
                         <View style={[styles.statusBox, styles.statusBoxPending]}>
                           <Text style={styles.statusBoxTextPending}>
-                            ⏳ Solicitud enviada ({reqData?.job_date || 'Pendiente'})
+                            ⏳ Solicitud enviada ({reqData?.job_date || 'Pendiente'} • {reqData?.job_time || ''})
                           </Text>
+
+                          {/* DESGLOSE EXPANDIBLE EN ESTADO PENDIENTE */}
+                          <TouchableOpacity 
+                            style={[styles.breakdownToggleBtn, { backgroundColor: '#fffaf0', borderColor: '#fbd38d' }]} 
+                            onPress={() => reqData?.id && toggleBreakdown(reqData.id)}
+                          >
+                            <Text style={[styles.breakdownToggleText, { color: '#9c4221' }]}>
+                              💳 Total estimado: {formatCLP(reqTotal)}
+                            </Text>
+                            <Text style={[styles.breakdownToggleArrow, { color: '#c05621' }]}>
+                              {isExpanded ? 'Ocultar ▲' : 'Ver detalle ▼'}
+                            </Text>
+                          </TouchableOpacity>
+
+                          {isExpanded && (
+                            <View style={styles.breakdownCard}>
+                              <View style={styles.breakdownRow}>
+                                <Text style={styles.breakdownLabel}>Cálculo ({reqHours} hrs × {formatCLP(reqRate)}):</Text>
+                                <Text style={styles.breakdownValue}>{formatCLP(reqTotal)}</Text>
+                              </View>
+                              <View style={styles.breakdownRow}>
+                                <Text style={styles.breakdownLabel}>Incluye Garantía y Soporte App (30%):</Text>
+                                <Text style={styles.breakdownValue}>{formatCLP(reqFee)}</Text>
+                              </View>
+                              <View style={styles.breakdownRow}>
+                                <Text style={styles.breakdownLabel}>Monto para la niñera (70%):</Text>
+                                <Text style={styles.breakdownValue}>{formatCLP(reqNet)}</Text>
+                              </View>
+                            </View>
+                          )}
+
                           <TouchableOpacity style={styles.cancelButton} onPress={() => handleCancelRequest(sitter.id)}>
                             <Text style={styles.cancelButtonText}>Cancelar Solicitud</Text>
                           </TouchableOpacity>
@@ -826,7 +975,7 @@ export default function ParentHomeScreen() {
         {activeTab === 'history' && (
           <View style={styles.contentArea}>
             <Text style={styles.sectionTitle}>Historial de Servicios</Text>
-            <Text style={styles.sectionSubtitle}>Consulta aquí los servicios completados y pasados.</Text>
+            <Text style={styles.sectionSubtitle}>Consulta aquí los servicios completados, sus cobros y calificaciones.</Text>
 
             {loadingHistory ? (
               <ActivityIndicator size="large" color="#3182ce" style={{ marginVertical: 32 }} />
@@ -840,6 +989,14 @@ export default function ParentHomeScreen() {
                   const sitter = item.babysitter_profiles || {};
                   const isCompleted = item.status === 'completed';
                   const isRejected = item.status === 'rejected';
+
+                  const histHours = getHoursFromTimeRange(item.job_time);
+                  const histRate = Number(sitter.hourly_rate) || 10000;
+                  const histTotal = Number(item.total_amount) || Math.round(histHours * histRate);
+                  const histFee = Number(item.platform_fee) || Math.round(histTotal * PLATFORM_COMMISSION_RATE);
+                  const histNet = Number(item.babysitter_payout) || (histTotal - histFee);
+                  const isHistExpanded = Boolean(expandedBreakdownIds['hist_' + item.id]);
+                  const payBadge = getPaymentStatusBadge(item.payment_status);
 
                   return (
                     <View key={item.id} style={styles.card}>
@@ -855,8 +1012,41 @@ export default function ParentHomeScreen() {
 
                       <View style={styles.jobDetailsBox}>
                         <Text style={styles.jobDetailsText}>📅 Fecha: {item.job_date || 'No especificado'}</Text>
-                        <Text style={styles.jobDetailsText}>⏰ Horario: {item.job_time || 'No especificado'}</Text>
+                        <Text style={styles.jobDetailsText}>⏰ Horario: {item.job_time || 'No especificado'} ({histHours} hrs)</Text>
                       </View>
+
+                      {/* DESGLOSE EXPANDIBLE EN HISTORIAL */}
+                      <TouchableOpacity 
+                        style={styles.breakdownToggleBtn} 
+                        onPress={() => toggleBreakdown('hist_' + item.id)}
+                      >
+                        <Text style={styles.breakdownToggleText}>
+                          💳 Monto del Servicio: {formatCLP(histTotal)}
+                        </Text>
+                        <Text style={styles.breakdownToggleArrow}>
+                          {isHistExpanded ? 'Ocultar detalle ▲' : 'Ver desglose ▼'}
+                        </Text>
+                      </TouchableOpacity>
+
+                      {isHistExpanded && (
+                        <View style={styles.breakdownCard}>
+                          <View style={styles.breakdownRow}>
+                            <Text style={styles.breakdownLabel}>Tarifa hora × {histHours} hrs:</Text>
+                            <Text style={styles.breakdownValue}>{formatCLP(histTotal)}</Text>
+                          </View>
+                          <View style={styles.breakdownRow}>
+                            <Text style={styles.breakdownLabel}>Pago líquido niñera (70%):</Text>
+                            <Text style={styles.breakdownValue}>{formatCLP(histNet)}</Text>
+                          </View>
+                          <View style={styles.breakdownRow}>
+                            <Text style={styles.breakdownLabel}>Comisión Plataforma (30%):</Text>
+                            <Text style={styles.breakdownValue}>{formatCLP(histFee)}</Text>
+                          </View>
+                          <View style={[styles.paymentStatusPill, { backgroundColor: payBadge.bg }]}>
+                            <Text style={[styles.paymentStatusPillText, { color: payBadge.color }]}>{payBadge.label}</Text>
+                          </View>
+                        </View>
+                      )}
 
                       <Text style={styles.dateText}>Registrado el: {new Date(item.created_at).toLocaleDateString()}</Text>
 
@@ -886,8 +1076,19 @@ export default function ParentHomeScreen() {
               <TextInput style={[styles.input, styles.textArea]} placeholder="Ej: 2 niños (3 y 5 años). El mayor es alérgico al maní." value={parentProfile.children_info} onChangeText={(text) => setParentProfile({ ...parentProfile, children_info: text })} multiline numberOfLines={3} />
               <Text style={styles.inputLabel}>Contacto de Emergencia</Text>
               <TextInput style={styles.input} placeholder="Nombre y teléfono de un familiar" value={parentProfile.emergency_contact} onChangeText={(text) => setParentProfile({ ...parentProfile, emergency_contact: text })} />
-              <TouchableOpacity style={styles.saveButton} onPress={handleSaveProfile} disabled={profileLoading}>
-                {profileLoading ? <ActivityIndicator color="#fff" size="small" /> : <Text style={styles.saveButtonText}>Guardar Perfil</Text>}
+              
+              <TouchableOpacity 
+                style={[styles.saveButton, profileSaveSuccess && styles.saveButtonSuccess]} 
+                onPress={handleSaveProfile} 
+                disabled={profileLoading}
+              >
+                {profileLoading ? (
+                  <ActivityIndicator color="#fff" size="small" />
+                ) : (
+                  <Text style={styles.saveButtonText}>
+                    {profileSaveSuccess ? '¡Guardado! ✅' : 'Guardar Perfil'}
+                  </Text>
+                )}
               </TouchableOpacity>
             </View>
           </View>
@@ -900,7 +1101,7 @@ export default function ParentHomeScreen() {
         </TouchableOpacity>
       </View>
 
-      {/* MODAL PARA SOLICITAR NIÑERA CON FECHAS EXACTAS (14 DÍAS) */}
+      {/* MODAL PARA SOLICITAR NIÑERA CON FECHAS EXACTAS Y DESGLOSE DE PAGO */}
       {selectedSitter && (
         <Modal visible={!!selectedSitter} transparent={true} animationType="fade" onRequestClose={() => setSelectedSitter(null)}>
           <View style={styles.modalOverlay}>
@@ -970,15 +1171,70 @@ export default function ParentHomeScreen() {
                   </ScrollView>
                 </View>
 
+                {/* RESUMEN Y DESGLOSE EXPANDIBLE EN MODAL DE SOLICITUD */}
                 <View style={styles.modalSection}>
-                  <Text style={styles.modalSectionTitle}>Tarifa por Hora</Text>
-                  <Text style={styles.modalPriceText}>${selectedSitter.hourly_rate}/hr</Text>
+                  <Text style={styles.modalSectionTitle}>💰 Resumen y Desglose del Cobro</Text>
+                  
+                  <TouchableOpacity 
+                    style={styles.modalPriceSummaryBox}
+                    onPress={() => setShowModalPriceBreakdown(!showModalPriceBreakdown)}
+                    activeOpacity={0.8}
+                  >
+                    <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <View>
+                        <Text style={{ fontSize: 13, color: '#4a5568', fontWeight: '600' }}>
+                          Total por {modalDurationHours} horas ({modalStartTime} - {modalEndTime})
+                        </Text>
+                        <Text style={styles.modalPriceText}>{formatCLP(modalTotalAmount)}</Text>
+                      </View>
+                      <View style={styles.expandPill}>
+                        <Text style={styles.expandPillText}>
+                          {showModalPriceBreakdown ? 'Ocultar ▲' : 'Ver detalle ▼'}
+                        </Text>
+                      </View>
+                    </View>
+
+                    {showModalPriceBreakdown && (
+                      <View style={styles.modalBreakdownInner}>
+                        <View style={styles.breakdownDivider} />
+                        <View style={styles.breakdownRow}>
+                          <Text style={styles.breakdownLabel}>Tarifa por hora de {selectedSitter.first_name}:</Text>
+                          <Text style={styles.breakdownValue}>{formatCLP(modalHourlyRate)}/hr</Text>
+                        </View>
+                        <View style={styles.breakdownRow}>
+                          <Text style={styles.breakdownLabel}>Tiempo seleccionado:</Text>
+                          <Text style={styles.breakdownValue}>{modalDurationHours} horas</Text>
+                        </View>
+                        <View style={styles.breakdownRow}>
+                          <Text style={styles.breakdownLabel}>Pago directo a la niñera (70%):</Text>
+                          <Text style={styles.breakdownValue}>{formatCLP(modalSitterNet)}</Text>
+                        </View>
+                        <View style={styles.breakdownRow}>
+                          <Text style={styles.breakdownLabel}>Comisión Gestión y Garantía Escrow (30%):</Text>
+                          <Text style={styles.breakdownValue}>{formatCLP(modalPlatformFee)}</Text>
+                        </View>
+                        <Text style={styles.escrowHelperText}>
+                          🛡️ Tu pago se mantiene protegido en garantía (Escrow) y solo se libera a la niñera cuando confirmas que el servicio finalizó con éxito.
+                        </Text>
+                      </View>
+                    )}
+                  </TouchableOpacity>
                 </View>
               </ScrollView>
 
               <View style={styles.modalActions}>
-                <TouchableOpacity style={styles.requestButton} onPress={() => confirmRequestBabysitter(selectedSitter.id)}>
-                  <Text style={styles.requestButtonText}>✨ Solicitar para el {modalDay}</Text>
+                <TouchableOpacity 
+                  style={[styles.requestButton, requestingId === selectedSitter.id && styles.requestButtonDisabled]} 
+                  onPress={() => confirmRequestBabysitter(selectedSitter.id)}
+                  disabled={requestingId === selectedSitter.id}
+                >
+                  {requestingId === selectedSitter.id ? (
+                    <ActivityIndicator color="#fff" />
+                  ) : (
+                    <Text style={styles.requestButtonText}>
+                      ✨ Solicitar por {formatCLP(modalTotalAmount)}
+                    </Text>
+                  )}
                 </TouchableOpacity>
                 <TouchableOpacity style={styles.closeModalButton} onPress={() => setSelectedSitter(null)}>
                   <Text style={styles.closeModalText}>Cerrar</Text>
@@ -1176,18 +1432,38 @@ const styles = StyleSheet.create({
   requestButtonDisabled: { opacity: 0.7 },
   requestButtonText: { color: '#ffffff', fontSize: 16, fontWeight: 'bold', letterSpacing: 0.3 },
   
-  statusBox: { padding: 16, borderRadius: 8, alignItems: 'center', marginTop: 4 },
+  statusBox: { padding: 16, borderRadius: 8, alignItems: 'center', marginTop: 4, width: '100%' },
   statusBoxPending: { backgroundColor: '#feebc8' },
-  statusBoxTextPending: { color: '#c05621', fontWeight: '600', fontSize: 14, marginBottom: 8 },
-  cancelButton: { backgroundColor: '#e53e3e', paddingVertical: 6, paddingHorizontal: 12, borderRadius: 6, marginTop: 4 },
+  statusBoxTextPending: { color: '#c05621', fontWeight: '600', fontSize: 14, marginBottom: 8, textAlign: 'center' },
+  cancelButton: { backgroundColor: '#e53e3e', paddingVertical: 8, paddingHorizontal: 14, borderRadius: 6, marginTop: 8 },
   cancelButtonText: { color: '#ffffff', fontWeight: 'bold', fontSize: 13 },
   
   statusBoxAccepted: { backgroundColor: '#ffffff', padding: 0 },
-  acceptedBanner: { backgroundColor: '#c6f6d5', borderWidth: 1, borderColor: '#9ae6b4', padding: 12, borderRadius: 8, marginBottom: 12, alignItems: 'center', width: '100%' },
+  acceptedBanner: { backgroundColor: '#c6f6d5', borderWidth: 1, borderColor: '#9ae6b4', padding: 12, borderRadius: 8, marginBottom: 10, alignItems: 'center', width: '100%' },
   acceptedBannerTitle: { fontSize: 16, fontWeight: 'bold', color: '#22543d', marginBottom: 4 },
   acceptedBannerSub: { fontSize: 14, color: '#2f855a', textAlign: 'center' },
+
+  // Estilos del desglose expandible
+  breakdownToggleBtn: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', width: '100%', backgroundColor: '#ebf8ff', borderWidth: 1, borderColor: '#bee3f8', paddingVertical: 10, paddingHorizontal: 12, borderRadius: 8, marginBottom: 8 },
+  breakdownToggleText: { fontSize: 14, fontWeight: 'bold', color: '#2b6cb0' },
+  breakdownToggleArrow: { fontSize: 12, fontWeight: '600', color: '#3182ce' },
+  breakdownCard: { width: '100%', backgroundColor: '#f8fafc', borderWidth: 1, borderColor: '#e2e8f0', borderRadius: 8, padding: 12, marginBottom: 10 },
+  breakdownRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginVertical: 3 },
+  breakdownLabel: { fontSize: 13, color: '#4a5568' },
+  breakdownValue: { fontSize: 13, fontWeight: '600', color: '#2d3748' },
+  breakdownTotalLabel: { fontSize: 14, fontWeight: 'bold', color: '#1a202c' },
+  breakdownTotalValue: { fontSize: 15, fontWeight: 'bold', color: '#2f855a' },
+  breakdownDivider: { height: 1, backgroundColor: '#e2e8f0', marginVertical: 6 },
+  paymentStatusPill: { marginTop: 8, paddingVertical: 6, paddingHorizontal: 10, borderRadius: 6, alignItems: 'center' },
+  paymentStatusPillText: { fontSize: 12, fontWeight: 'bold' },
+
+  modalPriceSummaryBox: { backgroundColor: '#f0fff4', borderWidth: 1, borderColor: '#9ae6b4', borderRadius: 10, padding: 14 },
+  expandPill: { backgroundColor: '#c6f6d5', paddingVertical: 4, paddingHorizontal: 10, borderRadius: 12 },
+  expandPillText: { fontSize: 12, fontWeight: 'bold', color: '#22543d' },
+  modalBreakdownInner: { marginTop: 8 },
+  escrowHelperText: { fontSize: 12, color: '#2f855a', marginTop: 8, lineHeight: 17, backgroundColor: '#e6fffa', padding: 8, borderRadius: 6 },
   
-  chatAppButton: { backgroundColor: '#805ad5', paddingVertical: 10, paddingHorizontal: 14, borderRadius: 8, alignItems: 'center', marginTop: 8, width: '100%' },
+  chatAppButton: { backgroundColor: '#805ad5', paddingVertical: 10, paddingHorizontal: 14, borderRadius: 8, alignItems: 'center', marginTop: 4, width: '100%' },
   chatAppButtonText: { color: '#ffffff', fontWeight: 'bold', fontSize: 14 },
   
   calendarButton: { backgroundColor: '#ecc94b', paddingVertical: 10, paddingHorizontal: 16, borderRadius: 6, marginBottom: 8, width: '100%', alignItems: 'center', marginTop: 8 },
@@ -1214,9 +1490,9 @@ const styles = StyleSheet.create({
   badge: { paddingVertical: 4, paddingHorizontal: 10, borderRadius: 12, fontSize: 12, fontWeight: 'bold', overflow: 'hidden' },
   badgeAccepted: { backgroundColor: '#c6f6d5', color: '#22543d' },
   badgeRejected: { backgroundColor: '#fed7d7', color: '#9b2c2c' },
-  jobDetailsBox: { backgroundColor: '#ebf8ff', padding: 12, borderRadius: 8, marginBottom: 12 },
+  jobDetailsBox: { backgroundColor: '#ebf8ff', padding: 12, borderRadius: 8, marginBottom: 10 },
   jobDetailsText: { fontSize: 14, color: '#2b6cb0', fontWeight: '600' },
-  dateText: { fontSize: 13, color: '#718096', marginBottom: 16 },
+  dateText: { fontSize: 13, color: '#718096', marginBottom: 12, marginTop: 4 },
 
   emptyState: { alignItems: 'center', marginTop: 20, padding: 20 },
   emptyText: { fontSize: 16, color: '#4a5568', fontWeight: 'bold', textAlign: 'center', marginBottom: 8 },
@@ -1228,7 +1504,8 @@ const styles = StyleSheet.create({
   inputLabel: { fontSize: 14, fontWeight: '600', color: '#4a5568', marginBottom: 8 },
   input: { backgroundColor: '#ffffff', borderWidth: 1, borderColor: '#cbd5e0', borderRadius: 8, paddingHorizontal: 14, paddingVertical: 12, fontSize: 15, color: '#2d3748', marginBottom: 20 },
   textArea: { height: 100, textAlignVertical: 'top' },
-  saveButton: { backgroundColor: '#38a169', paddingVertical: 14, borderRadius: 8, alignItems: 'center', marginTop: 8 },
+  saveButton: { backgroundColor: '#3182ce', paddingVertical: 14, borderRadius: 8, alignItems: 'center', marginTop: 8 },
+  saveButtonSuccess: { backgroundColor: '#38a169' },
   saveButtonText: { color: '#ffffff', fontSize: 16, fontWeight: 'bold' },
 
   footerContainer: { padding: 16, backgroundColor: '#ffffff', borderTopWidth: 1, borderTopColor: '#e2e8f0', alignItems: 'center', width: '100%' },
@@ -1258,7 +1535,7 @@ const styles = StyleSheet.create({
   skillsContainer: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
   skillBadge: { backgroundColor: '#e6fffa', paddingVertical: 6, paddingHorizontal: 12, borderRadius: 8, borderWidth: 1, borderColor: '#319795' },
   skillText: { color: '#285e61', fontSize: 13, fontWeight: '600' },
-  modalPriceText: { fontSize: 20, fontWeight: 'bold', color: '#38a169' },
+  modalPriceText: { fontSize: 22, fontWeight: 'bold', color: '#2f855a', marginTop: 2 },
   modalActions: { borderTopWidth: 1, borderTopColor: '#edf2f7', paddingTop: 12, marginTop: 4 },
   closeModalButton: { paddingVertical: 10, alignItems: 'center', marginTop: 4 },
   closeModalText: { color: '#718096', fontSize: 15, fontWeight: 'bold' },

@@ -18,6 +18,7 @@ import {
 const AVAILABLE_ZONES = ['Santiago Centro', 'Las Condes', 'Providencia', 'Vitacura'];
 const DAYS = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo'];
 const SHIFTS = ['Mañana', 'Tarde', 'Noche'];
+const PLATFORM_COMMISSION_RATE = 0.30; // 30% comisión MVP
 
 const showAlert = (title: string, message: string) => {
   if (Platform.OS === 'web') {
@@ -45,11 +46,29 @@ const buildGoogleCalendarDates = (jobDate?: string, jobTime?: string) => {
   return '&dates=' + ymd + 'T' + startH + startM + '00/' + ymd + 'T' + endH + endM + '00';
 };
 
-// --- NUEVO (Punto #3): Función para formatear a CLP (ej: "10000" -> "10.000") ---
-const formatCurrency = (value: string) => {
-  const cleanValue = value.replace(/\D/g, ''); // Quitar todo lo que no sea número
+// Función para formatear a CLP (ej: "10000" -> "$10.000 CLP")
+const formatCLP = (amount: number | string) => {
+  const num = Number(amount) || 0;
+  return '$' + new Intl.NumberFormat('es-CL').format(Math.round(num)) + ' CLP';
+};
+
+const formatCurrencyInput = (value: string) => {
+  const cleanValue = value.replace(/\D/g, ''); 
   if (!cleanValue) return '';
   return new Intl.NumberFormat('es-CL').format(Number(cleanValue));
+};
+
+const timeToMinutes = (timeStr: string) => {
+  const [hours, minutes] = timeStr.split(':').map(Number);
+  return hours * 60 + minutes;
+};
+
+const getHoursFromTimeRange = (jobTime?: string) => {
+  if (!jobTime) return 2;
+  const parts = jobTime.split('-').map(s => s.trim());
+  if (parts.length !== 2) return 2;
+  const diffMins = timeToMinutes(parts[1]) - timeToMinutes(parts[0]);
+  return diffMins > 0 ? diffMins / 60 : 2;
 };
 
 export default function BabysitterHomeScreen() {
@@ -61,8 +80,9 @@ export default function BabysitterHomeScreen() {
   const [updatingId, setUpdatingId] = useState<string | null>(null);
   const [loadingProfile, setLoadingProfile] = useState(false);
   const [savingProfile, setSavingProfile] = useState(false);
+  
+  const [expandedBreakdownIds, setExpandedBreakdownIds] = useState<{ [key: string]: boolean }>({});
 
-  // --- NUEVO (Punto #4): Estado para éxito del botón guardar ---
   const [isSaved, setIsSaved] = useState(false);
 
   const [firstName, setFirstName] = useState('');
@@ -86,6 +106,10 @@ export default function BabysitterHomeScreen() {
   const [messages, setMessages] = useState<any[]>([]);
   const [newMessage, setNewMessage] = useState('');
   const [sendingMessage, setSendingMessage] = useState(false);
+
+  const toggleBreakdown = (id: string) => {
+    setExpandedBreakdownIds(prev => ({ ...prev, [id]: !prev[id] }));
+  };
 
   useEffect(() => {
     let reqSubscription: any = null;
@@ -304,15 +328,25 @@ export default function BabysitterHomeScreen() {
   ) => {
     setUpdatingId(requestId);
     try {
+      
+      const updateData: any = { status: newStatus };
+      if (newStatus === 'accepted') {
+        updateData.payment_status = 'held';
+      } else if (newStatus === 'completed') {
+        updateData.payment_status = 'ready_for_payout';
+      } else if (newStatus === 'rejected') {
+        updateData.payment_status = 'refunded';
+      }
+
       const { error } = await supabase
         .from('job_requests')
-        .update({ status: newStatus })
+        .update(updateData)
         .eq('id', requestId);
 
       if (error) throw error;
 
       setRequests((prev) =>
-        prev.map((req) => (req.id === requestId ? { ...req, status: newStatus } : req))
+        prev.map((req) => (req.id === requestId ? { ...req, status: newStatus, payment_status: updateData.payment_status } : req))
       );
 
       if (newStatus === 'accepted') {
@@ -368,9 +402,8 @@ export default function BabysitterHomeScreen() {
       setLastName(data.last_name || '');
       setBio(data.bio || '');
       
-      // --- MODIFICADO (Punto #3): Formatear tarifa con puntos al cargar ---
       if (data.hourly_rate) {
-        setHourlyRate(formatCurrency(data.hourly_rate.toString()));
+        setHourlyRate(formatCurrencyInput(data.hourly_rate.toString()));
       }
 
       setExperience(data.experience_years ? data.experience_years.toString() : '');
@@ -404,7 +437,6 @@ export default function BabysitterHomeScreen() {
       return;
     }
 
-    // --- NUEVO (Punto #2): Extraer solo los números y validar el mínimo de $10.000 ---
     const numericRate = Number(hourlyRate.replace(/\D/g, ''));
     
     if (numericRate < 10000) {
@@ -425,7 +457,7 @@ export default function BabysitterHomeScreen() {
       first_name: firstName,
       last_name: lastName,
       bio,
-      hourly_rate: numericRate, // <-- Enviamos el número limpio a DB
+      hourly_rate: numericRate, 
       experience_years: Number(experience),
       location_zone: selectedZones.join(', '),
       available_days: availableDays,
@@ -441,9 +473,8 @@ export default function BabysitterHomeScreen() {
       console.error('Error al guardar:', error.message);
       showAlert('Error', 'Hubo un problema al guardar tu perfil. Revisa la consola.');
     } else {
-      // --- MODIFICADO (Punto #4): Microinteracción visual sin pop-ups nativos ---
       setIsSaved(true);
-      setTimeout(() => setIsSaved(false), 2000); // Vuelve al botón original en 2 segundos
+      setTimeout(() => setIsSaved(false), 2000); 
     }
   };
 
@@ -478,6 +509,19 @@ export default function BabysitterHomeScreen() {
 
   const unreadNotificationsCount = notifications.filter(n => !n.is_read).length;
 
+  const getPaymentStatusBadge = (paymentStatus?: string) => {
+    switch (paymentStatus) {
+      case 'held':
+        return { label: '🔒 Fondos retenidos seguros', color: '#c05621', bg: '#feebc8' };
+      case 'ready_for_payout':
+        return { label: '⏳ En proceso de transferencia a tu cuenta', color: '#2b6cb0', bg: '#ebf8ff' };
+      case 'paid_out':
+        return { label: '✅ Pago transferido', color: '#22543d', bg: '#c6f6d5' };
+      default:
+        return { label: '💳 Esperando confirmación', color: '#744210', bg: '#fefcbf' };
+    }
+  };
+
   return (
     <View style={styles.mainWrapper}>
       <ScrollView style={{ flex: 1 }} contentContainerStyle={styles.container}>
@@ -485,7 +529,7 @@ export default function BabysitterHomeScreen() {
         <View style={styles.headerContainer}>
           <View style={{ flex: 1 }}>
             <Text style={styles.title}>Panel de Niñera 👩‍🍼</Text>
-            <Text style={styles.subtitle}>Gestiona tus solicitudes y perfil.</Text>
+            <Text style={styles.subtitle}>Gestiona tus solicitudes y ganancias.</Text>
           </View>
           <TouchableOpacity style={styles.bellButton} onPress={() => setShowNotifications(true)}>
             <Text style={styles.bellIcon}>🔔</Text>
@@ -524,11 +568,19 @@ export default function BabysitterHomeScreen() {
                   const statusNormalized = String(req.status || '').toLowerCase().trim();
                   const parentInfo = req.parent_profiles || {};
                   const isAccepted = statusNormalized === 'accepted';
+                  
+                  const reqHours = getHoursFromTimeRange(req.job_time);
+                  const myRate = Number(hourlyRate.replace(/\D/g, '')) || 10000;
+                  const reqTotal = Number(req.total_amount) || Math.round(reqHours * myRate);
+                  const reqFee = Number(req.platform_fee) || Math.round(reqTotal * PLATFORM_COMMISSION_RATE);
+                  const reqNet = Number(req.babysitter_payout) || (reqTotal - reqFee);
+                  const isExpanded = Boolean(expandedBreakdownIds[req.id]);
+                  const payBadge = getPaymentStatusBadge(req.payment_status);
 
                   return (
                     <View key={req.id} style={styles.card}>
                       <View style={styles.cardHeader}>
-                        <Text style={styles.requestId}>Solicitud de trabajo</Text>
+                        <Text style={styles.requestId}>Nueva Solicitud de Trabajo</Text>
                         <Text style={[styles.badge, isAccepted ? styles.badgeAccepted : styles.badgePending]}>
                           {isAccepted ? 'Aceptada' : 'Pendiente'}
                         </Text>
@@ -537,16 +589,51 @@ export default function BabysitterHomeScreen() {
                       {(req.job_date || req.job_time) && (
                         <View style={styles.jobDetailsBox}>
                           <Text style={styles.jobDetailsText}>📅 Fecha: {req.job_date || 'No especificado'}</Text>
-                          <Text style={styles.jobDetailsText}>⏰ Horario: {req.job_time || 'No especificado'}</Text>
+                          <Text style={styles.jobDetailsText}>⏰ Horario: {req.job_time || 'No especificado'} ({reqHours} hrs)</Text>
                         </View>
                       )}
 
-                      {/* MEMORIA CLARA CUANDO ESTÁ ACEPTADA */}
+                      {/* DESGLOSE EXPANDIBLE DE GANANCIAS */}
+                      <TouchableOpacity 
+                        style={styles.breakdownToggleBtn} 
+                        onPress={() => toggleBreakdown(req.id)}
+                      >
+                        <Text style={styles.breakdownToggleText}>
+                          💳 Ganancia Líquida: {formatCLP(reqNet)}
+                        </Text>
+                        <Text style={styles.breakdownToggleArrow}>
+                          {isExpanded ? 'Ocultar desglose ▲' : 'Ver detalle ▼'}
+                        </Text>
+                      </TouchableOpacity>
+
+                      {isExpanded && (
+                        <View style={styles.breakdownCard}>
+                          <View style={styles.breakdownRow}>
+                            <Text style={styles.breakdownLabel}>Valor total del servicio:</Text>
+                            <Text style={styles.breakdownValue}>{formatCLP(reqTotal)}</Text>
+                          </View>
+                          <View style={styles.breakdownRow}>
+                            <Text style={styles.breakdownLabel}>Comisión Plataforma (30%):</Text>
+                            <Text style={[styles.breakdownValue, { color: '#e53e3e' }]}>-{formatCLP(reqFee)}</Text>
+                          </View>
+                          <View style={styles.breakdownDivider} />
+                          <View style={styles.breakdownRow}>
+                            <Text style={styles.breakdownTotalLabel}>Monto a transferir:</Text>
+                            <Text style={styles.breakdownTotalValue}>{formatCLP(reqNet)}</Text>
+                          </View>
+                          {isAccepted && (
+                             <View style={[styles.paymentStatusPill, { backgroundColor: payBadge.bg }]}>
+                               <Text style={[styles.paymentStatusPillText, { color: payBadge.color }]}>{payBadge.label}</Text>
+                             </View>
+                          )}
+                        </View>
+                      )}
+
                       {isAccepted && (
                         <View style={styles.acceptedBanner}>
                           <Text style={styles.acceptedBannerTitle}>🎉 ¡Servicio Confirmado!</Text>
                           <Text style={styles.acceptedBannerSub}>
-                            Agendado para el <Text style={{ fontWeight: 'bold' }}>{req.job_date || 'día indicado'}</Text> de <Text style={{ fontWeight: 'bold' }}>{req.job_time || 'horario indicado'}</Text>.
+                            Agendado para el <Text style={{ fontWeight: 'bold' }}>{req.job_date}</Text>.
                           </Text>
                         </View>
                       )}
@@ -585,13 +672,13 @@ export default function BabysitterHomeScreen() {
                       )}
 
                       <Text style={styles.dateText}>
-                        Enviada el: {new Date(req.created_at).toLocaleDateString()}
+                        Recibida el: {new Date(req.created_at).toLocaleDateString()}
                       </Text>
 
                       {!isAccepted && (
                         <View style={styles.actionRow}>
                           <TouchableOpacity style={[styles.actionButton, styles.acceptButton]} onPress={() => handleUpdateStatus(req.id, req.parent_id, 'accepted')} disabled={isUpdatingThis}>
-                            {isUpdatingThis ? <ActivityIndicator color="#fff" size="small" /> : <Text style={styles.actionButtonText}>Aceptar</Text>}
+                            {isUpdatingThis ? <ActivityIndicator color="#fff" size="small" /> : <Text style={styles.actionButtonText}>Aceptar Trabajo</Text>}
                           </TouchableOpacity>
 
                           <TouchableOpacity style={[styles.actionButton, styles.rejectButton]} onPress={() => handleUpdateStatus(req.id, req.parent_id, 'rejected')} disabled={isUpdatingThis}>
@@ -621,7 +708,7 @@ export default function BabysitterHomeScreen() {
 
         {activeTab === 'history' && (
           <View style={styles.contentArea}>
-            <Text style={styles.historyTitle}>Historial de Trabajos</Text>
+            <Text style={styles.historyTitle}>Historial de Ganancias</Text>
             <Text style={styles.historySubtitle}>Registro de servicios completados y cancelados.</Text>
 
             {loadingRequests ? (
@@ -636,6 +723,14 @@ export default function BabysitterHomeScreen() {
                   const isCompleted = statusNormalized === 'completed';
                   const isRejected = statusNormalized === 'rejected';
 
+                  const histHours = getHoursFromTimeRange(req.job_time);
+                  const myRate = Number(hourlyRate.replace(/\D/g, '')) || 10000;
+                  const histTotal = Number(req.total_amount) || Math.round(histHours * myRate);
+                  const histFee = Number(req.platform_fee) || Math.round(histTotal * PLATFORM_COMMISSION_RATE);
+                  const histNet = Number(req.babysitter_payout) || (histTotal - histFee);
+                  const isHistExpanded = Boolean(expandedBreakdownIds['hist_' + req.id]);
+                  const payBadge = getPaymentStatusBadge(req.payment_status);
+
                   return (
                     <View key={req.id} style={styles.card}>
                       <View style={styles.cardHeader}>
@@ -648,27 +743,58 @@ export default function BabysitterHomeScreen() {
                       {(req.job_date || req.job_time) && (
                         <View style={styles.jobDetailsBox}>
                           <Text style={styles.jobDetailsText}>📅 Fecha: {req.job_date || 'No especificado'}</Text>
-                          <Text style={styles.jobDetailsText}>⏰ Horario: {req.job_time || 'No especificado'}</Text>
+                          <Text style={styles.jobDetailsText}>⏰ Horario: {req.job_time || 'No especificado'} ({histHours} hrs)</Text>
                         </View>
+                      )}
+
+                      {/* DESGLOSE EXPANDIBLE EN HISTORIAL DE NIÑERA */}
+                      {isCompleted && (
+                        <>
+                          <TouchableOpacity 
+                            style={styles.breakdownToggleBtn} 
+                            onPress={() => toggleBreakdown('hist_' + req.id)}
+                          >
+                            <Text style={styles.breakdownToggleText}>
+                              💳 Ganancia Líquida: {formatCLP(histNet)}
+                            </Text>
+                            <Text style={styles.breakdownToggleArrow}>
+                              {isHistExpanded ? 'Ocultar desglose ▲' : 'Ver detalle ▼'}
+                            </Text>
+                          </TouchableOpacity>
+
+                          {isHistExpanded && (
+                            <View style={styles.breakdownCard}>
+                              <View style={styles.breakdownRow}>
+                                <Text style={styles.breakdownLabel}>Valor total del servicio:</Text>
+                                <Text style={styles.breakdownValue}>{formatCLP(histTotal)}</Text>
+                              </View>
+                              <View style={styles.breakdownRow}>
+                                <Text style={styles.breakdownLabel}>Comisión Plataforma (30%):</Text>
+                                <Text style={[styles.breakdownValue, { color: '#e53e3e' }]}>-{formatCLP(histFee)}</Text>
+                              </View>
+                              <View style={styles.breakdownDivider} />
+                              <View style={styles.breakdownRow}>
+                                <Text style={styles.breakdownTotalLabel}>Ganancia Neta:</Text>
+                                <Text style={styles.breakdownTotalValue}>{formatCLP(histNet)}</Text>
+                              </View>
+                              <View style={[styles.paymentStatusPill, { backgroundColor: payBadge.bg }]}>
+                                <Text style={[styles.paymentStatusPillText, { color: payBadge.color }]}>{payBadge.label}</Text>
+                              </View>
+                            </View>
+                          )}
+                        </>
                       )}
 
                       {isCompleted && (
                         <View style={styles.parentContactBox}>
-                          <Text style={styles.contactBoxTitle}>📍 Detalles del Servicio Realizado</Text>
+                          <Text style={styles.contactBoxTitle}>📍 Familia atendida</Text>
                           <Text style={styles.contactText}>🏠 Dirección: {parentInfo.address || 'No especificada'}</Text>
-                          <Text style={styles.contactText}>👶 Niños: {parentInfo.children_info || 'No especificado'}</Text>
                         </View>
                       )}
 
                       <Text style={styles.dateText}>
                         Fecha de solicitud: {new Date(req.created_at).toLocaleDateString()}
                       </Text>
-
-                      {isCompleted && (
-                        <View style={{ alignItems: 'center', marginTop: 4 }}>
-                          <Text style={{ color: '#38a169', fontWeight: 'bold', fontSize: 14 }}>⭐ Servicio finalizado con éxito</Text>
-                        </View>
-                      )}
                     </View>
                   );
                 })}
@@ -694,15 +820,14 @@ export default function BabysitterHomeScreen() {
                   <Text style={styles.label}>Sobre ti (Biografía corta)</Text>
                   <TextInput style={[styles.input, styles.textArea]} placeholder="Ej: Soy estudiante, muy responsable..." value={bio} onChangeText={setBio} multiline />
                   
-                  {/* --- MODIFICADO (Puntos #2 y #3): Input de tarifa con prefijo y formateo automático --- */}
-                  <Text style={styles.label}>Tarifa mínima por hora</Text>
+                  <Text style={styles.label}>Tarifa por hora</Text>
                   <View style={styles.currencyInputContainer}>
                     <Text style={styles.currencyPrefix}>CLP</Text>
                     <TextInput 
                       style={styles.currencyInput} 
                       placeholder="10.000" 
                       value={hourlyRate} 
-                      onChangeText={(val) => setHourlyRate(formatCurrency(val))} // <-- Formateo on-the-fly
+                      onChangeText={(val) => setHourlyRate(formatCurrencyInput(val))} 
                       keyboardType="numeric" 
                     />
                   </View>
@@ -748,7 +873,6 @@ export default function BabysitterHomeScreen() {
                     })}
                   </View>
 
-                  {/* --- MODIFICADO (Punto #4): Microinteracción visual al guardar --- */}
                   <TouchableOpacity 
                     style={[styles.saveButton, isSaved && styles.saveButtonSuccess]} 
                     onPress={saveProfile} 
@@ -762,7 +886,6 @@ export default function BabysitterHomeScreen() {
                       <Text style={styles.saveButtonText}>Guardar Perfil y Disponibilidad</Text>
                     )}
                   </TouchableOpacity>
-
                 </>
               )}
             </View>
@@ -776,7 +899,6 @@ export default function BabysitterHomeScreen() {
         </TouchableOpacity>
       </View>
 
-      {/* MODAL DE NOTIFICACIONES */}
       {showNotifications && (
         <Modal visible={showNotifications} transparent={true} animationType="slide" onRequestClose={() => setShowNotifications(false)}>
           <View style={styles.modalOverlay}>
@@ -819,7 +941,6 @@ export default function BabysitterHomeScreen() {
         </Modal>
       )}
 
-      {/* MODAL DE CHAT */}
       {isChatOpen && (
         <Modal visible={isChatOpen} transparent={true} animationType="slide" onRequestClose={() => setIsChatOpen(false)}>
           <View style={styles.modalOverlay}>
@@ -948,6 +1069,20 @@ const styles = StyleSheet.create({
   },
   jobDetailsText: { fontSize: 14, color: '#2b6cb0', fontWeight: '600' },
 
+  // Estilos del desglose expandible de niñera
+  breakdownToggleBtn: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', width: '100%', backgroundColor: '#f0fff4', borderWidth: 1, borderColor: '#c6f6d5', paddingVertical: 10, paddingHorizontal: 12, borderRadius: 8, marginBottom: 8 },
+  breakdownToggleText: { fontSize: 14, fontWeight: 'bold', color: '#2f855a' },
+  breakdownToggleArrow: { fontSize: 12, fontWeight: '600', color: '#38a169' },
+  breakdownCard: { width: '100%', backgroundColor: '#f8fafc', borderWidth: 1, borderColor: '#e2e8f0', borderRadius: 8, padding: 12, marginBottom: 12 },
+  breakdownRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginVertical: 3 },
+  breakdownLabel: { fontSize: 13, color: '#4a5568' },
+  breakdownValue: { fontSize: 13, fontWeight: '600', color: '#2d3748' },
+  breakdownTotalLabel: { fontSize: 14, fontWeight: 'bold', color: '#1a202c' },
+  breakdownTotalValue: { fontSize: 15, fontWeight: 'bold', color: '#2f855a' },
+  breakdownDivider: { height: 1, backgroundColor: '#e2e8f0', marginVertical: 6 },
+  paymentStatusPill: { marginTop: 8, paddingVertical: 6, paddingHorizontal: 10, borderRadius: 6, alignItems: 'center' },
+  paymentStatusPillText: { fontSize: 12, fontWeight: 'bold' },
+
   acceptedBanner: {
     backgroundColor: '#c6f6d5',
     borderWidth: 1,
@@ -961,15 +1096,15 @@ const styles = StyleSheet.create({
   acceptedBannerSub: { fontSize: 14, color: '#2f855a', textAlign: 'center' },
 
   parentContactBox: {
-    backgroundColor: '#f0fff4',
+    backgroundColor: '#f8fafc',
     borderWidth: 1,
-    borderColor: '#c6f6d5',
+    borderColor: '#e2e8f0',
     padding: 14,
     borderRadius: 8,
     marginBottom: 12,
   },
-  contactBoxTitle: { fontSize: 15, fontWeight: 'bold', color: '#22543d', marginBottom: 6 },
-  contactText: { fontSize: 14, color: '#2f855a', marginBottom: 4 },
+  contactBoxTitle: { fontSize: 15, fontWeight: 'bold', color: '#4a5568', marginBottom: 6 },
+  contactText: { fontSize: 14, color: '#4a5568', marginBottom: 4 },
   
   contactButton: { paddingVertical: 10, paddingHorizontal: 14, borderRadius: 8, alignItems: 'center', marginTop: 8, width: '100%' },
   chatAppButton: { backgroundColor: '#805ad5', paddingVertical: 10, paddingHorizontal: 14, borderRadius: 8, alignItems: 'center', marginTop: 8, width: '100%' },
@@ -1035,7 +1170,6 @@ const styles = StyleSheet.create({
   },
   textArea: { height: 100, textAlignVertical: 'top' },
 
-  // --- NUEVOS ESTILOS PARA EL INPUT DE MONEDA ---
   currencyInputContainer: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -1079,14 +1213,14 @@ const styles = StyleSheet.create({
   chipTextSelected: { color: '#2b6cb0' },
 
   saveButton: {
-    backgroundColor: '#3182ce', // Botón original azul
+    backgroundColor: '#3182ce',
     paddingVertical: 14,
     borderRadius: 8,
     alignItems: 'center',
     marginTop: 16,
   },
   saveButtonSuccess: {
-    backgroundColor: '#38a169', // Botón verde de éxito
+    backgroundColor: '#38a169',
   },
   saveButtonText: { color: '#fff', fontSize: 16, fontWeight: 'bold' },
 

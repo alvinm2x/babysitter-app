@@ -22,7 +22,7 @@ const showAlert = (title: string, message: string) => {
 };
 
 const formatCLP = (amount: number) => {
-  return '$' + new Intl.NumberFormat('es-CL').format(amount) + ' CLP';
+  return '$' + new Intl.NumberFormat('es-CL').format(Math.round(amount)) + ' CLP';
 };
 
 export default function AdminDashboardScreen() {
@@ -31,6 +31,13 @@ export default function AdminDashboardScreen() {
   const [loading, setLoading] = useState(true);
   const [requests, setRequests] = useState<any[]>([]);
   const [updatingId, setUpdatingId] = useState<string | null>(null);
+  
+  // Estado para expandir los desgloses financieros en las tarjetas de admin
+  const [expandedBreakdownIds, setExpandedBreakdownIds] = useState<{ [key: string]: boolean }>({});
+
+  const toggleBreakdown = (id: string) => {
+    setExpandedBreakdownIds(prev => ({ ...prev, [id]: !prev[id] }));
+  };
 
   useEffect(() => {
     fetchAdminData();
@@ -157,29 +164,70 @@ export default function AdminDashboardScreen() {
             {activeTab === 'upcoming' && (
               <View style={styles.listContainer}>
                 {upcomingRequests.length === 0 ? <Text style={styles.emptyText}>No hay servicios en curso.</Text> : null}
-                {upcomingRequests.map((req) => (
-                  <View key={req.id} style={styles.card}>
-                    <View style={styles.cardHeader}>
-                      <Text style={styles.requestId}>Servicio Aceptado</Text>
-                      <Text style={[styles.badge, styles.badgeAccepted]}>Agendado</Text>
-                    </View>
-                    <Text style={styles.dateText}>📅 {req.job_date} | ⏰ {req.job_time}</Text>
-                    
-                    <View style={styles.participantsBox}>
-                      <Text style={styles.participantTitle}>👶 Niñera: {req.babysitter.first_name} {req.babysitter.last_name}</Text>
-                      <TouchableOpacity style={styles.waButton} onPress={() => openWhatsApp(req.babysitter.phone, `¡Hola ${req.babysitter.first_name}! Te escribo de Babysitter App para confirmar tu servicio de hoy a las ${req.job_time}. ¿Vas en camino?`)}>
-                        <Text style={styles.waButtonText}>📲 Check-in Niñera</Text>
-                      </TouchableOpacity>
-                    </View>
+                {upcomingRequests.map((req) => {
+                  const isExpanded = Boolean(expandedBreakdownIds[req.id]);
+                  const totalAmt = Number(req.total_amount) || 0;
+                  const feeAmt = Number(req.platform_fee) || 0;
+                  const payoutAmt = Number(req.babysitter_payout) || 0;
 
-                    <View style={styles.participantsBox}>
-                      <Text style={styles.participantTitle}>🏡 Familia: {req.parent.address}</Text>
-                      <TouchableOpacity style={styles.waButton} onPress={() => openWhatsApp(req.parent.phone, `¡Hola! Te escribimos de Babysitter App. ¿Llegó bien ${req.babysitter.first_name} y está todo en orden con el servicio?`)}>
-                        <Text style={styles.waButtonText}>📲 Check-in Familia</Text>
+                  return (
+                    <View key={req.id} style={styles.card}>
+                      <View style={styles.cardHeader}>
+                        <Text style={styles.requestId}>Servicio Aceptado</Text>
+                        <Text style={[styles.badge, styles.badgeAccepted]}>Agendado</Text>
+                      </View>
+                      <Text style={styles.dateText}>📅 {req.job_date} | ⏰ {req.job_time}</Text>
+                      
+                      {/* ACORDEÓN DE DESGLOSE FINANCIERO PARA ADMIN */}
+                      <TouchableOpacity 
+                        style={styles.breakdownToggleBtn} 
+                        onPress={() => toggleBreakdown(req.id)}
+                      >
+                        <Text style={styles.breakdownToggleText}>
+                          📊 Auditoría Financiera: {formatCLP(totalAmt)}
+                        </Text>
+                        <Text style={styles.breakdownToggleArrow}>
+                          {isExpanded ? 'Ocultar ▲' : 'Ver desglose ▼'}
+                        </Text>
                       </TouchableOpacity>
+
+                      {isExpanded && (
+                        <View style={styles.breakdownCard}>
+                          <View style={styles.breakdownRow}>
+                            <Text style={styles.breakdownLabel}>Total pagado por familia:</Text>
+                            <Text style={styles.breakdownValue}>{formatCLP(totalAmt)}</Text>
+                          </View>
+                          <View style={styles.breakdownRow}>
+                            <Text style={styles.breakdownLabel}>Comisión Plataforma (30%):</Text>
+                            <Text style={[styles.breakdownValue, { color: '#2f855a' }]}>{formatCLP(feeAmt)}</Text>
+                          </View>
+                          <View style={styles.breakdownRow}>
+                            <Text style={styles.breakdownLabel}>Payout Niñera (70%):</Text>
+                            <Text style={styles.breakdownValue}>{formatCLP(payoutAmt)}</Text>
+                          </View>
+                          <View style={styles.breakdownDivider} />
+                          <Text style={{ fontSize: 11, color: '#718096', fontStyle: 'italic' }}>
+                            Estado Escrow: {req.payment_status || 'held'}
+                          </Text>
+                        </View>
+                      )}
+
+                      <View style={styles.participantsBox}>
+                        <Text style={styles.participantTitle}>👶 Niñera: {req.babysitter.first_name} {req.babysitter.last_name}</Text>
+                        <TouchableOpacity style={styles.waButton} onPress={() => openWhatsApp(req.babysitter.phone, `¡Hola ${req.babysitter.first_name}! Te escribo de Babysitter App para confirmar tu servicio de hoy a las ${req.job_time}. ¿Vas en camino?`)}>
+                          <Text style={styles.waButtonText}>📲 Check-in Niñera</Text>
+                        </TouchableOpacity>
+                      </View>
+
+                      <View style={styles.participantsBox}>
+                        <Text style={styles.participantTitle}>🏡 Familia: {req.parent.address}</Text>
+                        <TouchableOpacity style={styles.waButton} onPress={() => openWhatsApp(req.parent.phone, `¡Hola! Te escribimos de Babysitter App. ¿Llegó bien ${req.babysitter.first_name} y está todo en orden con el servicio?`)}>
+                          <Text style={styles.waButtonText}>📲 Check-in Familia</Text>
+                        </TouchableOpacity>
+                      </View>
                     </View>
-                  </View>
-                ))}
+                  );
+                })}
               </View>
             )}
 
@@ -230,21 +278,58 @@ export default function AdminDashboardScreen() {
                 {completedRequests.filter(r => r.payment_status === 'ready_for_payout').length === 0 ? (
                   <Text style={styles.emptyText}>No hay pagos pendientes a niñeras.</Text>
                 ) : (
-                  completedRequests.filter(r => r.payment_status === 'ready_for_payout').map(req => (
-                    <View key={req.id} style={styles.payoutCard}>
-                      <Text style={{ fontWeight: 'bold', fontSize: 16 }}>Pagar a: {req.babysitter.first_name} {req.babysitter.last_name}</Text>
-                      <Text style={{ fontSize: 18, color: '#2b6cb0', fontWeight: 'bold', marginVertical: 8 }}>{formatCLP(req.babysitter_payout)}</Text>
-                      <Text style={{ fontSize: 12, color: '#718096', marginBottom: 12 }}>Servicio completado el: {req.job_date}</Text>
-                      
-                      <TouchableOpacity 
-                        style={styles.payoutButton} 
-                        onPress={() => handleUpdatePaymentStatus(req.id, 'paid_out')}
-                        disabled={updatingId === req.id}
-                      >
-                        {updatingId === req.id ? <ActivityIndicator color="#fff" /> : <Text style={styles.payoutButtonText}>Marcar como Transferido ✅</Text>}
-                      </TouchableOpacity>
-                    </View>
-                  ))
+                  completedRequests.filter(r => r.payment_status === 'ready_for_payout').map(req => {
+                    const isHistExpanded = Boolean(expandedBreakdownIds['admin_payout_' + req.id]);
+                    const totalAmt = Number(req.total_amount) || 0;
+                    const feeAmt = Number(req.platform_fee) || 0;
+                    const payoutAmt = Number(req.babysitter_payout) || 0;
+
+                    return (
+                      <View key={req.id} style={styles.payoutCard}>
+                        <Text style={{ fontWeight: 'bold', fontSize: 16 }}>Pagar a: {req.babysitter.first_name} {req.babysitter.last_name}</Text>
+                        <Text style={{ fontSize: 18, color: '#2b6cb0', fontWeight: 'bold', marginVertical: 8 }}>{formatCLP(payoutAmt)}</Text>
+                        <Text style={{ fontSize: 12, color: '#718096', marginBottom: 10 }}>Servicio completado el: {req.job_date}</Text>
+                        
+                        {/* DESGLOSE EXPANDIBLE EN LIQUIDACIONES */}
+                        <TouchableOpacity 
+                          style={styles.breakdownToggleBtn} 
+                          onPress={() => toggleBreakdown('admin_payout_' + req.id)}
+                        >
+                          <Text style={styles.breakdownToggleText}>
+                            📊 Ver matemática del servicio
+                          </Text>
+                          <Text style={styles.breakdownToggleArrow}>
+                            {isHistExpanded ? 'Ocultar ▲' : 'Ver detalle ▼'}
+                          </Text>
+                        </TouchableOpacity>
+
+                        {isHistExpanded && (
+                          <View style={styles.breakdownCard}>
+                            <View style={styles.breakdownRow}>
+                              <Text style={styles.breakdownLabel}>Total cobrado al padre:</Text>
+                              <Text style={styles.breakdownValue}>{formatCLP(totalAmt)}</Text>
+                            </View>
+                            <View style={styles.breakdownRow}>
+                              <Text style={styles.breakdownLabel}>Comisión App (30%):</Text>
+                              <Text style={[styles.breakdownValue, { color: '#2f855a' }]}>{formatCLP(feeAmt)}</Text>
+                            </View>
+                            <View style={styles.breakdownRow}>
+                              <Text style={styles.breakdownLabel}>Transferencia neta:</Text>
+                              <Text style={[styles.breakdownValue, { fontWeight: 'bold' }]}>{formatCLP(payoutAmt)}</Text>
+                            </View>
+                          </View>
+                        )}
+
+                        <TouchableOpacity 
+                          style={[styles.payoutButton, { marginTop: 12 }]} 
+                          onPress={() => handleUpdatePaymentStatus(req.id, 'paid_out')}
+                          disabled={updatingId === req.id}
+                        >
+                          {updatingId === req.id ? <ActivityIndicator color="#fff" /> : <Text style={styles.payoutButtonText}>Marcar como Transferido ✅</Text>}
+                        </TouchableOpacity>
+                      </View>
+                    );
+                  })
                 )}
               </View>
             )}
@@ -285,6 +370,15 @@ const styles = StyleSheet.create({
   badgeAccepted: { backgroundColor: '#c6f6d5', color: '#22543d' },
   dateText: { fontSize: 15, color: '#4a5568', marginBottom: 16, fontWeight: '600' },
   
+  breakdownToggleBtn: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', width: '100%', backgroundColor: '#edf2f7', borderWidth: 1, borderColor: '#cbd5e0', paddingVertical: 8, paddingHorizontal: 12, borderRadius: 8, marginBottom: 12 },
+  breakdownToggleText: { fontSize: 13, fontWeight: 'bold', color: '#2b6cb0' },
+  breakdownToggleArrow: { fontSize: 12, fontWeight: '600', color: '#4a5568' },
+  breakdownCard: { width: '100%', backgroundColor: '#f8fafc', borderWidth: 1, borderColor: '#e2e8f0', borderRadius: 8, padding: 12, marginBottom: 12 },
+  breakdownRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginVertical: 3 },
+  breakdownLabel: { fontSize: 13, color: '#4a5568' },
+  breakdownValue: { fontSize: 13, fontWeight: '600', color: '#2d3748' },
+  breakdownDivider: { height: 1, backgroundColor: '#e2e8f0', marginVertical: 6 },
+
   participantsBox: { backgroundColor: '#f8fafc', padding: 12, borderRadius: 8, marginBottom: 12, borderWidth: 1, borderColor: '#e2e8f0' },
   participantTitle: { fontSize: 14, fontWeight: 'bold', color: '#4a5568', marginBottom: 8 },
   
@@ -297,7 +391,7 @@ const styles = StyleSheet.create({
   financeValue: { fontSize: 20, fontWeight: 'bold', color: '#2d3748' },
   
   sectionTitle: { fontSize: 18, fontWeight: 'bold', color: '#2d3748', marginBottom: 16 },
-  payoutCard: { backgroundColor: '#fff', padding: 16, borderRadius: 12, borderWidth: 1, borderColor: '#cbd5e0', marginBottom: 12 },
+  payoutCard: { backgroundColor: '#fff', padding: 16, borderRadius: 12, borderWidth: 1, borderColor: '#cbd5e0', marginBottom: 16 },
   payoutButton: { backgroundColor: '#3182ce', paddingVertical: 12, borderRadius: 8, alignItems: 'center' },
   payoutButtonText: { color: '#fff', fontWeight: 'bold', fontSize: 15 },
   
