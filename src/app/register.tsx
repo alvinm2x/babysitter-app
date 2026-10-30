@@ -8,11 +8,14 @@ export default function RegisterScreen() {
   const [fullName, setFullName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [confirmPassword, setConfirmPassword] = useState(''); // <-- NUEVO: Estado de confirmación
+  const [confirmPassword, setConfirmPassword] = useState('');
   const [role, setRole] = useState<'parent' | 'babysitter'>('parent');
   const [loading, setLoading] = useState(false);
 
-  // <-- NUEVO: Helper multiplataforma para alertas (evita errores en Vercel/Web)
+  // Estados para el toggle de visibilidad del ojito
+  const [showPassword, setShowPassword] = useState(false);
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
+
   const showAlert = (title: string, message: string) => {
     if (Platform.OS === 'web') {
       alert(`${title}: ${message}`);
@@ -22,7 +25,6 @@ export default function RegisterScreen() {
   };
 
   const handleRegister = async () => {
-    // <-- NUEVO: Validaciones de contraseña
     if (!email || !password || !confirmPassword || !fullName) {
       showAlert('Campos requeridos', 'Por favor completa todos los campos.');
       return;
@@ -118,22 +120,37 @@ export default function RegisterScreen() {
         keyboardType="email-address"
       />
 
-      <TextInput
-        style={styles.input}
-        placeholder="Contraseña"
-        value={password}
-        onChangeText={setPassword}
-        secureTextEntry
-      />
+      <View style={styles.passwordWrapper}>
+        <TextInput
+          style={styles.passwordInput}
+          placeholder="Contraseña"
+          value={password}
+          onChangeText={setPassword}
+          secureTextEntry={!showPassword}
+        />
+        <TouchableOpacity 
+          style={styles.eyeButton} 
+          onPress={() => setShowPassword(!showPassword)}
+        >
+          <Text style={styles.eyeIcon}>{showPassword ? '🙈' : '👁️'}</Text>
+        </TouchableOpacity>
+      </View>
 
-      {/* <-- NUEVO: Campo de confirmación */}
-      <TextInput
-        style={styles.input}
-        placeholder="Confirmar Contraseña"
-        value={confirmPassword}
-        onChangeText={setConfirmPassword}
-        secureTextEntry
-      />
+      <View style={styles.passwordWrapper}>
+        <TextInput
+          style={styles.passwordInput}
+          placeholder="Confirmar Contraseña"
+          value={confirmPassword}
+          onChangeText={setConfirmPassword}
+          secureTextEntry={!showConfirmPassword}
+        />
+        <TouchableOpacity 
+          style={styles.eyeButton} 
+          onPress={() => setShowConfirmPassword(!showConfirmPassword)}
+        >
+          <Text style={styles.eyeIcon}>{showConfirmPassword ? '🙈' : '👁️'}</Text>
+        </TouchableOpacity>
+      </View>
 
       <TouchableOpacity style={styles.button} onPress={handleRegister} disabled={loading}>
         {loading ? <ActivityIndicator color="#FFF" /> : <Text style={styles.buttonText}>Registrarse</Text>}
@@ -156,6 +173,10 @@ const styles = StyleSheet.create({
   roleText: { color: '#4A5568', fontWeight: '600' },
   roleTextActive: { color: '#FFF' },
   input: { width: '100%', maxWidth: 400, height: 48, backgroundColor: '#FFF', borderWidth: 1, borderColor: '#E2E8F0', borderRadius: 8, paddingHorizontal: 16, marginBottom: 12, fontSize: 16 },
+  passwordWrapper: { width: '100%', maxWidth: 400, flexDirection: 'row', alignItems: 'center', backgroundColor: '#FFF', borderWidth: 1, borderColor: '#E2E8F0', borderRadius: 8, marginBottom: 12 },
+  passwordInput: { flex: 1, height: 48, paddingHorizontal: 16, fontSize: 16 },
+  eyeButton: { padding: 12 },
+  eyeIcon: { fontSize: 18 },
   button: { width: '100%', maxWidth: 400, height: 48, backgroundColor: '#3182CE', justifyContent: 'center', alignItems: 'center', borderRadius: 8, marginTop: 8 },
   buttonText: { color: '#FFF', fontSize: 16, fontWeight: 'bold' },
   link: { marginTop: 20, color: '#3182CE', fontSize: 14, textDecorationLine: 'underline' },

@@ -16,8 +16,6 @@ import {
 } from 'react-native';
 
 const FILTER_ZONES = ['Todas', 'Santiago Centro', 'Las Condes', 'Providencia', 'Vitacura'];
-const FILTER_DAYS = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo'];
-const FILTER_SHIFTS = ['Mañana', 'Tarde', 'Noche'];
 
 const AVAILABLE_TIMES = [
   '08:00', '08:30', '09:00', '09:30', '10:00', '10:30',
@@ -28,7 +26,6 @@ const AVAILABLE_TIMES = [
 ];
 
 const JS_DAYS_MAP = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'];
-
 const PLATFORM_COMMISSION_RATE = 0.30; // 30% comisión MVP
 
 const showAlert = (title: string, message: string) => {
@@ -49,7 +46,6 @@ const timeToMinutes = (timeStr: string) => {
   return hours * 60 + minutes;
 };
 
-// Extrae la cantidad de horas desde un string "09:00 - 11:30" -> 2.5
 const getHoursFromTimeRange = (jobTime?: string) => {
   if (!jobTime) return 2;
   const parts = jobTime.split('-').map(s => s.trim());
@@ -58,8 +54,8 @@ const getHoursFromTimeRange = (jobTime?: string) => {
   return diffMins > 0 ? diffMins / 60 : 2;
 };
 
-// Genera los próximos 14 días cruzados con la disponibilidad de la niñera
-const getUpcoming14Days = (allowedDays?: string[]) => {
+// Genera los próximos 14 días (sin filtro de niñera, para el buscador global)
+const getGlobalUpcoming14Days = () => {
   const result: { label: string; value: string; dayName: string }[] = [];
   const today = new Date();
 
@@ -68,17 +64,13 @@ const getUpcoming14Days = (allowedDays?: string[]) => {
     d.setDate(today.getDate() + i);
     const dayName = JS_DAYS_MAP[d.getDay()];
 
-    if (Array.isArray(allowedDays) && allowedDays.length > 0 && !allowedDays.includes(dayName)) {
-      continue;
-    }
-
     const dd = String(d.getDate()).padStart(2, '0');
     const mm = String(d.getMonth() + 1).padStart(2, '0');
     const yyyy = d.getFullYear();
 
     const shortDay = dayName.slice(0, 3);
     result.push({
-      label: shortDay + ' ' + dd + '/' + mm,
+      label: i === 0 ? 'Hoy' : i === 1 ? 'Mañana' : shortDay + ' ' + dd + '/' + mm,
       value: dayName + ' ' + dd + '/' + mm + '/' + yyyy,
       dayName: dayName,
     });
@@ -86,7 +78,6 @@ const getUpcoming14Days = (allowedDays?: string[]) => {
   return result;
 };
 
-// Convierte "Martes 27/10/2026" y "09:00 - 11:00" en "20261027T090000/20261027T110000"
 const buildGoogleCalendarDates = (jobDate?: string, jobTime?: string) => {
   if (!jobDate || !jobTime) return '';
   const dateMatch = jobDate.match(/(\d{2})\/(\d{2})\/(\d{4})/);
@@ -112,9 +103,12 @@ export default function ParentHomeScreen() {
   const [loadingAuth, setLoadingAuth] = useState(false);
   const [loadingData, setLoadingData] = useState(true);
   
+  // Opciones globales del buscador
+  const globalDates = getGlobalUpcoming14Days();
   const [selectedZone, setSelectedZone] = useState<string>('Todas');
-  const [selectedDay, setSelectedDay] = useState<string>('Todos');
-  const [selectedShift, setSelectedShift] = useState<string>('Todos');
+  const [selectedGlobalDate, setSelectedGlobalDate] = useState<{ label: string; value: string; dayName: string }>(globalDates[0]);
+  const [selectedGlobalStartTime, setSelectedGlobalStartTime] = useState<string>('09:00');
+  const [selectedGlobalEndTime, setSelectedGlobalEndTime] = useState<string>('11:00');
 
   const [babysitters, setBabysitters] = useState<any[]>([]);
   const [myRequests, setMyRequests] = useState<{ [key: string]: any }>({});
@@ -123,13 +117,7 @@ export default function ParentHomeScreen() {
   const [requestingId, setRequestingId] = useState<string | null>(null);
 
   const [selectedSitter, setSelectedSitter] = useState<any | null>(null);
-  const [modalDateOptions, setModalDateOptions] = useState<{ label: string; value: string; dayName: string }[]>([]);
-  const [modalDay, setModalDay] = useState<string>('');
-  const [modalStartTime, setModalStartTime] = useState<string>('09:00');
-  const [modalEndTime, setModalEndTime] = useState<string>('11:00');
   const [showModalPriceBreakdown, setShowModalPriceBreakdown] = useState<boolean>(false);
-
-  // Estado para expandir/contraer el detalle de cobro en tarjetas activas e historial
   const [expandedBreakdownIds, setExpandedBreakdownIds] = useState<{ [key: string]: boolean }>({});
 
   const [reviewingSitter, setReviewingSitter] = useState<any | null>(null);
@@ -140,7 +128,6 @@ export default function ParentHomeScreen() {
   const [notifications, setNotifications] = useState<any[]>([]);
   const [showNotifications, setShowNotifications] = useState(false);
 
-  // Estados del Chat
   const [isChatOpen, setIsChatOpen] = useState(false);
   const [activeChatSitter, setActiveChatSitter] = useState<any | null>(null);
   const [activeRequestId, setActiveRequestId] = useState<string | null>(null);
@@ -148,12 +135,7 @@ export default function ParentHomeScreen() {
   const [newMessage, setNewMessage] = useState('');
   const [sendingMessage, setSendingMessage] = useState(false);
 
-  const [parentProfile, setParentProfile] = useState({
-    phone: '',
-    address: '',
-    children_info: '',
-    emergency_contact: ''
-  });
+  const [parentProfile, setParentProfile] = useState({ phone: '', address: '', children_info: '', emergency_contact: '' });
   const [profileLoading, setProfileLoading] = useState(false);
   const [profileSaveSuccess, setProfileSaveSuccess] = useState(false);
 
@@ -174,28 +156,19 @@ export default function ParentHomeScreen() {
       const { data: { user } } = await supabase.auth.getUser();
       
       if (user) {
-        reqSubscription = supabase
-          .channel('parent_realtime_updates')
-          .on(
-            'postgres_changes',
-            { event: '*', schema: 'public', table: 'job_requests', filter: 'parent_id=eq.' + user.id },
-            () => {
-              loadMyRequests();
-              loadHistoryRequests();
-            }
-          )
-          .subscribe();
+        supabase.removeChannel(supabase.channel('parent_realtime_updates'));
+        supabase.removeChannel(supabase.channel('parent_realtime_notifs'));
 
-        notifSubscription = supabase
-          .channel('parent_realtime_notifs')
-          .on(
-            'postgres_changes',
-            { event: '*', schema: 'public', table: 'notifications', filter: 'user_id=eq.' + user.id },
-            () => {
-              loadNotifications();
-            }
-          )
-          .subscribe();
+        reqSubscription = supabase.channel('parent_realtime_updates')
+          .on('postgres_changes', { event: '*', schema: 'public', table: 'job_requests', filter: 'parent_id=eq.' + user.id }, () => {
+            loadMyRequests();
+            loadHistoryRequests();
+          }).subscribe();
+
+        notifSubscription = supabase.channel('parent_realtime_notifs')
+          .on('postgres_changes', { event: '*', schema: 'public', table: 'notifications', filter: 'user_id=eq.' + user.id }, () => {
+            loadNotifications();
+          }).subscribe();
       }
     };
 
@@ -211,40 +184,26 @@ export default function ParentHomeScreen() {
 
     if (isChatOpen && activeRequestId) {
       loadMessages(activeRequestId);
+      supabase.removeChannel(supabase.channel('chat_' + activeRequestId));
 
       chatSub = supabase.channel('chat_' + activeRequestId)
-        .on(
-          'postgres_changes',
-          { event: 'INSERT', schema: 'public', table: 'messages', filter: 'request_id=eq.' + activeRequestId },
-          (payload) => {
-            setMessages((prev) => [...prev, payload.new]);
-          }
-        )
-        .subscribe();
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: 'request_id=eq.' + activeRequestId }, (payload) => {
+          setMessages((prev) => [...prev, payload.new]);
+        }).subscribe();
     }
 
-    return () => {
-      if (chatSub) supabase.removeChannel(chatSub);
-    };
+    return () => { if (chatSub) supabase.removeChannel(chatSub); };
   }, [isChatOpen, activeRequestId]);
 
   useEffect(() => {
     loadBabysitters();
-  }, [selectedZone, selectedDay, selectedShift]);
+  }, [selectedZone, selectedGlobalDate, selectedGlobalStartTime, selectedGlobalEndTime]);
 
   const loadMessages = async (reqId: string) => {
     try {
-      const { data, error } = await supabase
-        .from('messages')
-        .select('*')
-        .eq('request_id', reqId)
-        .order('created_at', { ascending: true });
-      if (!error && data) {
-        setMessages(data);
-      }
-    } catch (err) {
-      console.error(err);
-    }
+      const { data, error } = await supabase.from('messages').select('*').eq('request_id', reqId).order('created_at', { ascending: true });
+      if (!error && data) setMessages(data);
+    } catch (err) { console.error(err); }
   };
 
   const sendMessage = async () => {
@@ -254,17 +213,11 @@ export default function ParentHomeScreen() {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) return;
       
-      const { error } = await supabase.from('messages').insert([{
-        request_id: activeRequestId,
-        sender_id: user.id,
-        receiver_id: activeChatSitter.id,
-        content: newMessage.trim()
-      }]);
+      const { error } = await supabase.from('messages').insert([{ request_id: activeRequestId, sender_id: user.id, receiver_id: activeChatSitter.id, content: newMessage.trim() }]);
       if (error) throw error;
       
       setNewMessage('');
       await sendNotificationToSitter(activeChatSitter.id, "💬 Nuevo Mensaje", "El padre te ha enviado un mensaje en el chat.");
-
     } catch (err: any) {
       showAlert("Error al enviar", err.message);
     } finally {
@@ -274,40 +227,24 @@ export default function ParentHomeScreen() {
 
   const sendNotificationToSitter = async (sitterId: string, title: string, message: string) => {
     try {
-      await supabase.from('notifications').insert([{
-        user_id: sitterId,
-        title: title,
-        message: message
-      }]);
-    } catch (err) {
-      console.error("Error al enviar notificación", err);
-    }
+      await supabase.from('notifications').insert([{ user_id: sitterId, title: title, message: message }]);
+    } catch (err) { console.error("Error al enviar notificación", err); }
   };
 
   const loadNotifications = async () => {
     try {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) return;
-      const { data, error } = await supabase
-        .from('notifications')
-        .select('*')
-        .eq('user_id', user.id)
-        .order('created_at', { ascending: false });
-      if (!error && data) {
-        setNotifications(data);
-      }
-    } catch (err) {
-      console.error(err);
-    }
+      const { data, error } = await supabase.from('notifications').select('*').eq('user_id', user.id).order('created_at', { ascending: false });
+      if (!error && data) setNotifications(data);
+    } catch (err) { console.error(err); }
   };
 
   const markNotificationAsRead = async (id: string) => {
     try {
       await supabase.from('notifications').update({ is_read: true }).eq('id', id);
       setNotifications(prev => prev.map(n => n.id === id ? { ...n, is_read: true } : n));
-    } catch (err) {
-      console.error(err);
-    }
+    } catch (err) { console.error(err); }
   };
 
   const markAllNotificationsAsRead = async () => {
@@ -316,28 +253,43 @@ export default function ParentHomeScreen() {
       if (!user) return;
       await supabase.from('notifications').update({ is_read: true }).eq('user_id', user.id).eq('is_read', false);
       setNotifications(prev => prev.map(n => ({ ...n, is_read: true })));
-    } catch (err) {
-      console.error(err);
+    } catch (err) { console.error(err); }
+  };
+
+  const handleGlobalStartTimeChange = (newStartTime: string) => {
+    setSelectedGlobalStartTime(newStartTime);
+    const startMins = timeToMinutes(newStartTime);
+    const endMins = timeToMinutes(selectedGlobalEndTime);
+
+    if (endMins - startMins < 120) {
+      const validEndTimes = AVAILABLE_TIMES.filter(t => timeToMinutes(t) >= startMins + 120);
+      if (validEndTimes.length > 0) setSelectedGlobalEndTime(validEndTimes[0]);
     }
+  };
+
+  // Función auxiliar para determinar si un rango de horas (ej: 09:00 - 11:00) cae en la Mañana, Tarde o Noche
+  const getShiftFromTimes = (start: string) => {
+    const startMins = timeToMinutes(start);
+    if (startMins < 720) return 'Mañana'; // Antes de las 12:00
+    if (startMins < 1140) return 'Tarde'; // Antes de las 19:00
+    return 'Noche';
   };
 
   const loadBabysitters = async () => {
     setLoadingData(true);
     try {
-      let query = supabase
-        .from('babysitter_profiles')
-        .select('*')
-        .order('rating', { ascending: false, nullsFirst: false });
+      let query = supabase.from('babysitter_profiles').select('*').order('rating', { ascending: false, nullsFirst: false });
 
       if (selectedZone !== 'Todas') {
         query = query.ilike('location_zone', '%' + selectedZone + '%');
       }
-      if (selectedDay !== 'Todos') {
-        query = query.contains('available_days', [selectedDay]);
-      }
-      if (selectedShift !== 'Todos') {
-        query = query.contains('available_shifts', [selectedShift]);
-      }
+      
+      // Filtrar automáticamente por el día de la semana correspondiente a la fecha seleccionada
+      query = query.contains('available_days', [selectedGlobalDate.dayName]);
+      
+      // Filtrar automáticamente por el turno (Mañana/Tarde/Noche) basado en la hora de inicio seleccionada
+      const shiftRequired = getShiftFromTimes(selectedGlobalStartTime);
+      query = query.contains('available_shifts', [shiftRequired]);
 
       const { data, error } = await query;
       if (error) throw error;
@@ -353,19 +305,13 @@ export default function ParentHomeScreen() {
     try {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) return;
-      const { data, error } = await supabase
-        .from('job_requests')
-        .select('id, babysitter_id, status, job_date, job_time, total_amount, platform_fee, babysitter_payout, payment_status')
-        .eq('parent_id', user.id)
-        .in('status', ['pending', 'accepted']);
+      const { data, error } = await supabase.from('job_requests').select('id, babysitter_id, status, job_date, job_time, total_amount, platform_fee, babysitter_payout, payment_status').eq('parent_id', user.id).in('status', ['pending', 'accepted']);
       if (error) throw error;
 
       const requestsMap: { [key: string]: any } = {};
       data?.forEach((req) => { requestsMap[req.babysitter_id] = req; });
       setMyRequests(requestsMap);
-    } catch (error: any) {
-      console.error("Error al cargar solicitudes:", error.message);
-    }
+    } catch (error: any) { console.error("Error al cargar solicitudes:", error.message); }
   };
 
   const loadHistoryRequests = async () => {
@@ -374,82 +320,31 @@ export default function ParentHomeScreen() {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) return;
 
-      const { data: reqs, error } = await supabase
-        .from('job_requests')
-        .select('*')
-        .eq('parent_id', user.id)
-        .in('status', ['completed', 'rejected', 'dismissed'])
-        .order('created_at', { ascending: false });
-
+      const { data: reqs, error } = await supabase.from('job_requests').select('*').eq('parent_id', user.id).in('status', ['completed', 'rejected', 'dismissed']).order('created_at', { ascending: false });
       if (error) throw error;
-      if (!reqs || reqs.length === 0) {
-        setHistoryRequests([]);
-        setLoadingHistory(false);
-        return;
-      }
+      if (!reqs || reqs.length === 0) { setHistoryRequests([]); setLoadingHistory(false); return; }
 
       const sitterIds = Array.from(new Set(reqs.map(r => r.babysitter_id).filter(Boolean)));
       let sittersMap: { [key: string]: any } = {};
 
       if (sitterIds.length > 0) {
-        const { data: sittersData, error: sittersErr } = await supabase
-          .from('babysitter_profiles')
-          .select('id, first_name, last_name, location_zone, hourly_rate')
-          .in('id', sitterIds);
-
-        if (!sittersErr && sittersData) {
-          sittersData.forEach(s => {
-            sittersMap[s.id] = s;
-          });
-        }
+        const { data: sittersData, error: sittersErr } = await supabase.from('babysitter_profiles').select('id, first_name, last_name, location_zone, hourly_rate').in('id', sitterIds);
+        if (!sittersErr && sittersData) sittersData.forEach(s => { sittersMap[s.id] = s; });
       }
 
-      const combined = reqs.map(r => ({
-        ...r,
-        babysitter_profiles: sittersMap[r.babysitter_id] || {}
-      }));
-
+      const combined = reqs.map(r => ({ ...r, babysitter_profiles: sittersMap[r.babysitter_id] || {} }));
       setHistoryRequests(combined);
-    } catch (error: any) {
-      console.error("Error al cargar historial:", error.message);
-    } finally {
-      setLoadingHistory(false);
-    }
+    } catch (error: any) { console.error("Error al cargar historial:", error.message); } finally { setLoadingHistory(false); }
   };
 
   const handleOpenSitterModal = (sitter: any) => {
     setSelectedSitter(sitter);
     setShowModalPriceBreakdown(false);
-    const upcomingDates = getUpcoming14Days(sitter.available_days);
-    setModalDateOptions(upcomingDates);
-
-    if (selectedDay !== 'Todos') {
-      const matchingDate = upcomingDates.find(d => d.dayName === selectedDay);
-      setModalDay(matchingDate ? matchingDate.value : (upcomingDates[0]?.value || 'Lunes'));
-    } else {
-      setModalDay(upcomingDates[0]?.value || 'Lunes');
-    }
-
-    setModalStartTime('09:00');
-    setModalEndTime('11:00');
-  };
-
-  const handleStartTimeChange = (newStartTime: string) => {
-    setModalStartTime(newStartTime);
-    const startMins = timeToMinutes(newStartTime);
-    const endMins = timeToMinutes(modalEndTime);
-
-    if (endMins - startMins < 120) {
-      const validEndTimes = AVAILABLE_TIMES.filter(t => timeToMinutes(t) >= startMins + 120);
-      if (validEndTimes.length > 0) {
-        setModalEndTime(validEndTimes[0]);
-      }
-    }
   };
 
   const confirmRequestBabysitter = async (babysitterId: string) => {
-    const startMins = timeToMinutes(modalStartTime);
-    const endMins = timeToMinutes(modalEndTime);
+    const startMins = timeToMinutes(selectedGlobalStartTime);
+    const endMins = timeToMinutes(selectedGlobalEndTime);
 
     if (endMins - startMins < 120) {
       showAlert("Duración insuficiente", "El servicio requiere un mínimo de 2 horas.");
@@ -462,25 +357,19 @@ export default function ParentHomeScreen() {
     const platformFee = Math.round(totalAmount * PLATFORM_COMMISSION_RATE);
     const babysitterPayout = totalAmount - platformFee;
 
-    const timeRangeString = modalStartTime + " - " + modalEndTime;
+    const timeRangeString = selectedGlobalStartTime + " - " + selectedGlobalEndTime;
 
     setRequestingId(babysitterId);
     try {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) throw new Error("No hay sesión activa");
 
-      const { data: existingReq, error: checkError } = await supabase
-        .from('job_requests')
-        .select('id')
-        .eq('parent_id', user.id)
-        .eq('babysitter_id', babysitterId)
-        .maybeSingle();
-
+      const { data: existingReq, error: checkError } = await supabase.from('job_requests').select('id').eq('parent_id', user.id).eq('babysitter_id', babysitterId).maybeSingle();
       if (checkError) throw checkError;
 
       const jobDetails = {
         status: 'pending',
-        job_date: modalDay,
+        job_date: selectedGlobalDate.value,
         job_time: timeRangeString,
         total_amount: totalAmount,
         platform_fee: platformFee,
@@ -492,23 +381,15 @@ export default function ParentHomeScreen() {
         const { error: updateError } = await supabase.from('job_requests').update(jobDetails).eq('id', existingReq.id);
         if (updateError) throw updateError;
       } else {
-        const { error: insertError } = await supabase.from('job_requests').insert([{ 
-          parent_id: user.id, 
-          babysitter_id: babysitterId, 
-          ...jobDetails
-        }]);
+        const { error: insertError } = await supabase.from('job_requests').insert([{ parent_id: user.id, babysitter_id: babysitterId, ...jobDetails }]);
         if (insertError) throw insertError;
       }
 
-      showAlert(
-        "¡Solicitud enviada!",
-        "Has solicitado a esta niñera para el " + modalDay + " de " + timeRangeString + ".\nTotal estimado: " + formatCLP(totalAmount)
-      );
+      showAlert("¡Solicitud enviada!", "Has solicitado a esta niñera para el " + selectedGlobalDate.value + " de " + timeRangeString + ".\nTotal estimado: " + formatCLP(totalAmount));
       loadMyRequests();
       setSelectedSitter(null);
       
-      await sendNotificationToSitter(babysitterId, "Nueva Solicitud", "Un padre te ha enviado una solicitud de trabajo para el " + modalDay + " (" + formatCLP(babysitterPayout) + " líquidos).");
-
+      await sendNotificationToSitter(babysitterId, "Nueva Solicitud", "Un padre te ha enviado una solicitud de trabajo para el " + selectedGlobalDate.value + " (" + formatCLP(babysitterPayout) + " líquidos).");
     } catch (error: any) {
       showAlert("Error", error.message);
     } finally {
@@ -520,24 +401,13 @@ export default function ParentHomeScreen() {
     try {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) return;
-      const { error } = await supabase
-        .from('job_requests')
-        .update({ 
-          status: 'completed',
-          payment_status: 'ready_for_payout'
-        })
-        .eq('parent_id', user.id)
-        .eq('babysitter_id', babysitterId);
+      const { error } = await supabase.from('job_requests').update({ status: 'completed', payment_status: 'ready_for_payout' }).eq('parent_id', user.id).eq('babysitter_id', babysitterId);
       if (error) throw error;
       setMyRequests(prev => { const copy = { ...prev }; delete copy[babysitterId]; return copy; });
       loadHistoryRequests();
       showAlert("¡Servicio completado!", "El pago ha pasado a liberación y ahora puedes calificar la atención en tu historial.");
-
       await sendNotificationToSitter(babysitterId, "Trabajo Completado", "El padre ha marcado el servicio como completado y tu pago está listo para liquidación. ¡Buen trabajo!");
-
-    } catch (error: any) {
-      showAlert("Error", error.message);
-    }
+    } catch (error: any) { showAlert("Error", error.message); }
   };
 
   const handleCancelRequest = async (babysitterId: string) => {
@@ -547,12 +417,8 @@ export default function ParentHomeScreen() {
       await supabase.from('job_requests').update({ status: 'dismissed' }).eq('parent_id', user.id).eq('babysitter_id', babysitterId);
       setMyRequests(prev => { const copy = { ...prev }; delete copy[babysitterId]; return copy; });
       loadHistoryRequests();
-
       await sendNotificationToSitter(babysitterId, "Solicitud Cancelada", "El padre ha cancelado la solicitud de trabajo.");
-
-    } catch (error: any) {
-      showAlert("Error al cancelar", error.message);
-    }
+    } catch (error: any) { showAlert("Error al cancelar", error.message); }
   };
 
   const handleOpenWhatsApp = (sitter: any, phone: string) => {
@@ -577,34 +443,17 @@ export default function ParentHomeScreen() {
       if (!user) throw new Error("No hay sesión activa");
 
       const sitterIdToReview = reviewingSitter.babysitter_id || reviewingSitter.id;
-
-      const { error: revError } = await supabase.from('reviews').insert([{
-        babysitter_id: sitterIdToReview,
-        parent_id: user.id,
-        rating: reviewRating,
-        comment: reviewComment
-      }]);
+      const { error: revError } = await supabase.from('reviews').insert([{ babysitter_id: sitterIdToReview, parent_id: user.id, rating: reviewRating, comment: reviewComment }]);
       if (revError) throw revError;
 
-      const { data: allReviews, error: fetchErr } = await supabase
-        .from('reviews')
-        .select('rating')
-        .eq('babysitter_id', sitterIdToReview);
-
+      const { data: allReviews, error: fetchErr } = await supabase.from('reviews').select('rating').eq('babysitter_id', sitterIdToReview);
       if (fetchErr) throw fetchErr;
 
       const totalReviews = allReviews.length;
       const sumRatings = allReviews.reduce((acc, curr) => acc + curr.rating, 0);
       const newAverage = Number((sumRatings / totalReviews).toFixed(1));
 
-      const { error: updateErr } = await supabase
-        .from('babysitter_profiles')
-        .update({
-          rating: newAverage,
-          reviews_count: totalReviews
-        })
-        .eq('id', sitterIdToReview);
-
+      const { error: updateErr } = await supabase.from('babysitter_profiles').update({ rating: newAverage, reviews_count: totalReviews }).eq('id', sitterIdToReview);
       if (updateErr) throw updateErr;
 
       showAlert("¡Gracias!", "Tu reseña ha sido publicada con éxito.");
@@ -615,34 +464,17 @@ export default function ParentHomeScreen() {
       loadHistoryRequests();
       
       await sendNotificationToSitter(sitterIdToReview, "Nueva Calificación", "¡Has recibido una nueva calificación de " + reviewRating + " estrellas!");
-
-    } catch (error: any) {
-      showAlert("Error", error.message);
-    } finally {
-      setSubmittingReview(false);
-    }
+    } catch (error: any) { showAlert("Error", error.message); } finally { setSubmittingReview(false); }
   };
 
   const loadParentProfile = async () => {
     try {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) return;
-
-      const { data, error } = await supabase
-        .from('parent_profiles')
-        .select('*')
-        .eq('id', user.id)
-        .maybeSingle();
-
+      const { data, error } = await supabase.from('parent_profiles').select('*').eq('id', user.id).maybeSingle();
       if (error && error.code !== 'PGRST116') return;
-
       if (data) {
-        setParentProfile({
-          phone: data.phone || '',
-          address: data.address || '',
-          children_info: data.children_info || '',
-          emergency_contact: data.emergency_contact || ''
-        });
+        setParentProfile({ phone: data.phone || '', address: data.address || '', children_info: data.children_info || '', emergency_contact: data.emergency_contact || '' });
       }
     } catch (error) {}
   };
@@ -654,24 +486,12 @@ export default function ParentHomeScreen() {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) throw new Error("No hay sesión activa");
 
-      const updates = {
-        id: user.id,
-        phone: parentProfile.phone,
-        address: parentProfile.address,
-        children_info: parentProfile.children_info,
-        emergency_contact: parentProfile.emergency_contact,
-        updated_at: new Date()
-      };
-
+      const updates = { id: user.id, phone: parentProfile.phone, address: parentProfile.address, children_info: parentProfile.children_info, emergency_contact: parentProfile.emergency_contact, updated_at: new Date() };
       const { error } = await supabase.from('parent_profiles').upsert(updates);
       if (error) throw error;
       setProfileSaveSuccess(true);
       setTimeout(() => setProfileSaveSuccess(false), 3000);
-    } catch (error: any) {
-      showAlert("Error", error.message);
-    } finally {
-      setProfileLoading(false);
-    }
+    } catch (error: any) { showAlert("Error", error.message); } finally { setProfileLoading(false); }
   };
 
   const handleSignOut = async () => {
@@ -681,14 +501,10 @@ export default function ParentHomeScreen() {
     if (!error) router.replace('/');
   };
 
-  const availableEndTimes = AVAILABLE_TIMES.filter(
-    time => timeToMinutes(time) >= timeToMinutes(modalStartTime) + 120
-  );
-
+  const globalAvailableEndTimes = AVAILABLE_TIMES.filter(time => timeToMinutes(time) >= timeToMinutes(selectedGlobalStartTime) + 120);
   const unreadNotificationsCount = notifications.filter(n => !n.is_read).length;
 
-  // Cálculos en vivo para el modal de solicitud
-  const modalDurationHours = Math.max(2, (timeToMinutes(modalEndTime) - timeToMinutes(modalStartTime)) / 60);
+  const modalDurationHours = Math.max(2, (timeToMinutes(selectedGlobalEndTime) - timeToMinutes(selectedGlobalStartTime)) / 60);
   const modalHourlyRate = Number(selectedSitter?.hourly_rate) || 10000;
   const modalTotalAmount = Math.round(modalDurationHours * modalHourlyRate);
   const modalPlatformFee = Math.round(modalTotalAmount * PLATFORM_COMMISSION_RATE);
@@ -696,16 +512,11 @@ export default function ParentHomeScreen() {
 
   const getPaymentStatusBadge = (paymentStatus?: string) => {
     switch (paymentStatus) {
-      case 'held':
-        return { label: '🔒 Pago Retenido en Garantía (Escrow)', color: '#c05621', bg: '#feebc8' };
-      case 'ready_for_payout':
-        return { label: '⏳ En proceso de liberación a niñera', color: '#2b6cb0', bg: '#ebf8ff' };
-      case 'paid_out':
-        return { label: '✅ Liquidado a la niñera', color: '#22543d', bg: '#c6f6d5' };
-      case 'refunded':
-        return { label: '↩️ Reembolsado', color: '#718096', bg: '#edf2f7' };
-      default:
-        return { label: '💳 Pendiente de cobro / retención', color: '#744210', bg: '#fefcbf' };
+      case 'held': return { label: '🔒 Pago Retenido en Garantía (Escrow)', color: '#c05621', bg: '#feebc8' };
+      case 'ready_for_payout': return { label: '⏳ En proceso de liberación a niñera', color: '#2b6cb0', bg: '#ebf8ff' };
+      case 'paid_out': return { label: '✅ Liquidado a la niñera', color: '#22543d', bg: '#c6f6d5' };
+      case 'refunded': return { label: '↩️ Reembolsado', color: '#718096', bg: '#edf2f7' };
+      default: return { label: '💳 Pendiente de cobro / retención', color: '#744210', bg: '#fefcbf' };
     }
   };
 
@@ -716,7 +527,7 @@ export default function ParentHomeScreen() {
         <View style={styles.headerContainer}>
           <View style={{ flex: 1 }}>
             <Text style={styles.title}>Panel de Padres 👨‍👩‍👧</Text>
-            <Text style={styles.subtitle}>Selecciona cuándo necesitas ayuda.</Text>
+            <Text style={styles.subtitle}>Encuentra a la niñera ideal para ti.</Text>
           </View>
           <TouchableOpacity style={styles.bellButton} onPress={() => setShowNotifications(true)}>
             <Text style={styles.bellIcon}>🔔</Text>
@@ -745,37 +556,53 @@ export default function ParentHomeScreen() {
         {activeTab === 'nannies' && (
           <View style={styles.contentArea}>
             <View style={styles.filtersContainer}>
+              
+              {/* BUSCADOR FASE 3: FECHA EXACTA */}
               <View style={styles.filterSection}>
-                <Text style={styles.filterLabel}>1. ¿Qué día necesitas?</Text>
+                <Text style={styles.filterLabel}>1. ¿Para cuándo necesitas la niñera?</Text>
                 <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.filterScroll}>
-                  {['Todos', ...FILTER_DAYS].map(day => (
-                    <TouchableOpacity key={day} style={[styles.filterChip, selectedDay === day && styles.filterChipSelected]} onPress={() => setSelectedDay(day)}>
-                      <Text style={[styles.filterChipText, selectedDay === day && styles.filterChipTextSelected]}>{day === 'Todos' ? '📅 Cualquier día' : day}</Text>
+                  {globalDates.map(dateObj => (
+                    <TouchableOpacity key={dateObj.value} style={[styles.filterChip, selectedGlobalDate.value === dateObj.value && styles.filterChipSelected]} onPress={() => setSelectedGlobalDate(dateObj)}>
+                      <Text style={[styles.filterChipText, selectedGlobalDate.value === dateObj.value && styles.filterChipTextSelected]}>📅 {dateObj.label}</Text>
                     </TouchableOpacity>
                   ))}
                 </ScrollView>
               </View>
 
+              {/* BUSCADOR FASE 3: HORA INICIO */}
               <View style={styles.filterSection}>
-                <Text style={styles.filterLabel}>2. ¿En qué horario genérico?</Text>
+                <Text style={styles.filterLabel}>2. ¿A qué hora comienza?</Text>
                 <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.filterScroll}>
-                  {['Todos', ...FILTER_SHIFTS].map(shift => (
-                    <TouchableOpacity key={shift} style={[styles.filterChip, selectedShift === shift && styles.filterChipSelected]} onPress={() => setSelectedShift(shift)}>
-                      <Text style={[styles.filterChipText, selectedShift === shift && styles.filterChipTextSelected]}>{shift === 'Todos' ? '⏰ Cualquier horario' : shift}</Text>
+                  {AVAILABLE_TIMES.map(time => (
+                    <TouchableOpacity key={time} style={[styles.filterChip, selectedGlobalStartTime === time && styles.filterChipSelected]} onPress={() => handleGlobalStartTimeChange(time)}>
+                      <Text style={[styles.filterChipText, selectedGlobalStartTime === time && styles.filterChipTextSelected]}>⏰ {time}</Text>
                     </TouchableOpacity>
                   ))}
                 </ScrollView>
               </View>
 
+              {/* BUSCADOR FASE 3: HORA TÉRMINO */}
               <View style={styles.filterSection}>
-                <Text style={styles.filterLabel}>3. ¿En qué comuna?</Text>
+                <Text style={styles.filterLabel}>3. ¿A qué hora termina? (Mínimo 2 hrs)</Text>
                 <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.filterScroll}>
+                  {globalAvailableEndTimes.map(time => (
+                    <TouchableOpacity key={time} style={[styles.filterChip, selectedGlobalEndTime === time && styles.filterChipSelected]} onPress={() => setSelectedGlobalEndTime(time)}>
+                      <Text style={[styles.filterChipText, selectedGlobalEndTime === time && styles.filterChipTextSelected]}>🏁 {time}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </ScrollView>
+              </View>
+
+              {/* BUSCADOR FASE 2: COMUNAS CON FLEX-WRAP PARA EVITAR CORTES */}
+              <View style={styles.filterSection}>
+                <Text style={styles.filterLabel}>4. ¿En qué comuna?</Text>
+                <View style={styles.wrapContainer}>
                   {FILTER_ZONES.map(zone => (
                     <TouchableOpacity key={zone} style={[styles.filterChip, selectedZone === zone && styles.filterChipSelected]} onPress={() => setSelectedZone(zone)}>
                       <Text style={[styles.filterChipText, selectedZone === zone && styles.filterChipTextSelected]}>{zone === 'Todas' ? '🌎 Todas' : '📍 ' + zone}</Text>
                     </TouchableOpacity>
                   ))}
-                </ScrollView>
+                </View>
               </View>
             </View>
 
@@ -783,18 +610,18 @@ export default function ParentHomeScreen() {
               <ActivityIndicator size="large" color="#3182ce" style={{ marginVertical: 32 }} />
             ) : babysitters.length === 0 ? (
               <View style={styles.emptyState}>
-                <Text style={styles.emptyText}>No hay niñeras disponibles con esta combinación.</Text>
-                <Text style={styles.emptySubText}>Intenta flexibilizar el día, el horario o la comuna.</Text>
+                <Text style={styles.emptyText}>No hay niñeras disponibles para esta fecha/hora/comuna.</Text>
+                <Text style={styles.emptySubText}>Intenta modificar tu búsqueda en los filtros superiores.</Text>
               </View>
             ) : (
               <View style={styles.listContainer}>
+                <Text style={styles.resultsSummary}>✨ Mostrando niñeras disponibles para el {selectedGlobalDate.label} de {selectedGlobalStartTime} a {selectedGlobalEndTime}</Text>
                 {babysitters.map((sitter) => {
                   const reqData = myRequests[sitter.id];
                   const requestStatus = reqData?.status;
                   const rawPhone = sitter.phone_number || sitter.phone || sitter.telefono || "";
                   const ratingLabel = sitter.rating ? Number(sitter.rating).toFixed(1) : 'Nuevo';
 
-                  // Datos financieros de la solicitud activa (si existe)
                   const reqHours = getHoursFromTimeRange(reqData?.job_time);
                   const reqRate = Number(sitter.hourly_rate) || 10000;
                   const reqTotal = Number(reqData?.total_amount) || Math.round(reqHours * reqRate);
@@ -834,11 +661,8 @@ export default function ParentHomeScreen() {
                         <Text style={styles.cardExp}>⭐ {sitter.experience_years} años exp.</Text>
                       </View>
 
-                      <TouchableOpacity
-                        style={styles.viewProfileButton}
-                        onPress={() => handleOpenSitterModal(sitter)}
-                      >
-                        <Text style={styles.viewProfileButtonText}>🔍 Ver Perfil y Seleccionar Fecha</Text>
+                      <TouchableOpacity style={styles.viewProfileButton} onPress={() => handleOpenSitterModal(sitter)}>
+                        <Text style={styles.viewProfileButtonText}>🔍 Ver Perfil y Confirmar Reserva</Text>
                       </TouchableOpacity>
 
                       {requestStatus === 'accepted' ? (
@@ -851,17 +675,9 @@ export default function ParentHomeScreen() {
                             </Text>
                           </View>
 
-                          {/* BOTÓN EXPANDIBLE DE DESGLOSE DE PAGO */}
-                          <TouchableOpacity 
-                            style={styles.breakdownToggleBtn} 
-                            onPress={() => reqData?.id && toggleBreakdown(reqData.id)}
-                          >
-                            <Text style={styles.breakdownToggleText}>
-                              💳 Total a Pagar: {formatCLP(reqTotal)}
-                            </Text>
-                            <Text style={styles.breakdownToggleArrow}>
-                              {isExpanded ? 'Ocultar detalle ▲' : 'Ver detalle ▼'}
-                            </Text>
+                          <TouchableOpacity style={styles.breakdownToggleBtn} onPress={() => reqData?.id && toggleBreakdown(reqData.id)}>
+                            <Text style={styles.breakdownToggleText}>💳 Total a Pagar: {formatCLP(reqTotal)}</Text>
+                            <Text style={styles.breakdownToggleArrow}>{isExpanded ? 'Ocultar detalle ▲' : 'Ver detalle ▼'}</Text>
                           </TouchableOpacity>
 
                           {isExpanded && (
@@ -894,14 +710,7 @@ export default function ParentHomeScreen() {
                             </View>
                           )}
 
-                          <TouchableOpacity 
-                            style={styles.chatAppButton} 
-                            onPress={() => { 
-                              setActiveChatSitter(sitter); 
-                              setActiveRequestId(reqData?.id); 
-                              setIsChatOpen(true); 
-                            }}
-                          >
+                          <TouchableOpacity style={styles.chatAppButton} onPress={() => { setActiveChatSitter(sitter); setActiveRequestId(reqData?.id); setIsChatOpen(true); }}>
                             <Text style={styles.chatAppButtonText}>💬 Chat en la App</Text>
                           </TouchableOpacity>
 
@@ -929,17 +738,9 @@ export default function ParentHomeScreen() {
                             ⏳ Solicitud enviada ({reqData?.job_date || 'Pendiente'} • {reqData?.job_time || ''})
                           </Text>
 
-                          {/* DESGLOSE EXPANDIBLE EN ESTADO PENDIENTE */}
-                          <TouchableOpacity 
-                            style={[styles.breakdownToggleBtn, { backgroundColor: '#fffaf0', borderColor: '#fbd38d' }]} 
-                            onPress={() => reqData?.id && toggleBreakdown(reqData.id)}
-                          >
-                            <Text style={[styles.breakdownToggleText, { color: '#9c4221' }]}>
-                              💳 Total estimado: {formatCLP(reqTotal)}
-                            </Text>
-                            <Text style={[styles.breakdownToggleArrow, { color: '#c05621' }]}>
-                              {isExpanded ? 'Ocultar ▲' : 'Ver detalle ▼'}
-                            </Text>
+                          <TouchableOpacity style={[styles.breakdownToggleBtn, { backgroundColor: '#fffaf0', borderColor: '#fbd38d' }]} onPress={() => reqData?.id && toggleBreakdown(reqData.id)}>
+                            <Text style={[styles.breakdownToggleText, { color: '#9c4221' }]}>💳 Total estimado: {formatCLP(reqTotal)}</Text>
+                            <Text style={[styles.breakdownToggleArrow, { color: '#c05621' }]}>{isExpanded ? 'Ocultar ▲' : 'Ver detalle ▼'}</Text>
                           </TouchableOpacity>
 
                           {isExpanded && (
@@ -1015,17 +816,9 @@ export default function ParentHomeScreen() {
                         <Text style={styles.jobDetailsText}>⏰ Horario: {item.job_time || 'No especificado'} ({histHours} hrs)</Text>
                       </View>
 
-                      {/* DESGLOSE EXPANDIBLE EN HISTORIAL */}
-                      <TouchableOpacity 
-                        style={styles.breakdownToggleBtn} 
-                        onPress={() => toggleBreakdown('hist_' + item.id)}
-                      >
-                        <Text style={styles.breakdownToggleText}>
-                          💳 Monto del Servicio: {formatCLP(histTotal)}
-                        </Text>
-                        <Text style={styles.breakdownToggleArrow}>
-                          {isHistExpanded ? 'Ocultar detalle ▲' : 'Ver desglose ▼'}
-                        </Text>
+                      <TouchableOpacity style={styles.breakdownToggleBtn} onPress={() => toggleBreakdown('hist_' + item.id)}>
+                        <Text style={styles.breakdownToggleText}>💳 Monto del Servicio: {formatCLP(histTotal)}</Text>
+                        <Text style={styles.breakdownToggleArrow}>{isHistExpanded ? 'Ocultar detalle ▲' : 'Ver desglose ▼'}</Text>
                       </TouchableOpacity>
 
                       {isHistExpanded && (
@@ -1077,18 +870,8 @@ export default function ParentHomeScreen() {
               <Text style={styles.inputLabel}>Contacto de Emergencia</Text>
               <TextInput style={styles.input} placeholder="Nombre y teléfono de un familiar" value={parentProfile.emergency_contact} onChangeText={(text) => setParentProfile({ ...parentProfile, emergency_contact: text })} />
               
-              <TouchableOpacity 
-                style={[styles.saveButton, profileSaveSuccess && styles.saveButtonSuccess]} 
-                onPress={handleSaveProfile} 
-                disabled={profileLoading}
-              >
-                {profileLoading ? (
-                  <ActivityIndicator color="#fff" size="small" />
-                ) : (
-                  <Text style={styles.saveButtonText}>
-                    {profileSaveSuccess ? '¡Guardado! ✅' : 'Guardar Perfil'}
-                  </Text>
-                )}
+              <TouchableOpacity style={[styles.saveButton, profileSaveSuccess && styles.saveButtonSuccess]} onPress={handleSaveProfile} disabled={profileLoading}>
+                {profileLoading ? <ActivityIndicator color="#fff" size="small" /> : <Text style={styles.saveButtonText}>{profileSaveSuccess ? '¡Guardado! ✅' : 'Guardar Perfil'}</Text>}
               </TouchableOpacity>
             </View>
           </View>
@@ -1101,7 +884,7 @@ export default function ParentHomeScreen() {
         </TouchableOpacity>
       </View>
 
-      {/* MODAL PARA SOLICITAR NIÑERA CON FECHAS EXACTAS Y DESGLOSE DE PAGO */}
+      {/* MODAL SIMPLIFICADO: RECIBE FECHA/HORA PRESELECCIONADA DESDE EL BUSCADOR GLOBAL */}
       {selectedSitter && (
         <Modal visible={!!selectedSitter} transparent={true} animationType="fade" onRequestClose={() => setSelectedSitter(null)}>
           <View style={styles.modalOverlay}>
@@ -1136,61 +919,16 @@ export default function ParentHomeScreen() {
                 </View>
 
                 <View style={styles.modalSection}>
-                  <Text style={styles.modalSectionTitle}>📅 Selecciona la Fecha Exacta (Próximos 14 días)</Text>
-                  <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.modalChipScroll}>
-                    {modalDateOptions.map((item) => (
-                      <TouchableOpacity key={item.value} style={[styles.modalChip, modalDay === item.value && styles.modalChipSelected]} onPress={() => setModalDay(item.value)}>
-                        <Text style={[styles.modalChipText, modalDay === item.value && styles.modalChipTextSelected]}>{item.label}</Text>
-                      </TouchableOpacity>
-                    ))}
-                  </ScrollView>
-                  <Text style={{ fontSize: 12, color: '#2b6cb0', marginTop: 6, fontWeight: '600' }}>
-                    Fecha elegida: {modalDay}
-                  </Text>
-                </View>
-
-                <View style={styles.modalSection}>
-                  <Text style={styles.modalSectionTitle}>⏰ Hora de Inicio</Text>
-                  <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.modalChipScroll}>
-                    {AVAILABLE_TIMES.map((time) => (
-                      <TouchableOpacity key={time} style={[styles.modalChip, modalStartTime === time && styles.modalChipSelected]} onPress={() => handleStartTimeChange(time)}>
-                        <Text style={[styles.modalChipText, modalStartTime === time && styles.modalChipTextSelected]}>{time}</Text>
-                      </TouchableOpacity>
-                    ))}
-                  </ScrollView>
-                </View>
-
-                <View style={styles.modalSection}>
-                  <Text style={styles.modalSectionTitle}>🏁 Hora de Término (Mínimo 2 horas)</Text>
-                  <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.modalChipScroll}>
-                    {availableEndTimes.map((time) => (
-                      <TouchableOpacity key={time} style={[styles.modalChip, modalEndTime === time && styles.modalChipSelected]} onPress={() => setModalEndTime(time)}>
-                        <Text style={[styles.modalChipText, modalEndTime === time && styles.modalChipTextSelected]}>{time}</Text>
-                      </TouchableOpacity>
-                    ))}
-                  </ScrollView>
-                </View>
-
-                {/* RESUMEN Y DESGLOSE EXPANDIBLE EN MODAL DE SOLICITUD */}
-                <View style={styles.modalSection}>
-                  <Text style={styles.modalSectionTitle}>💰 Resumen y Desglose del Cobro</Text>
-                  
-                  <TouchableOpacity 
-                    style={styles.modalPriceSummaryBox}
-                    onPress={() => setShowModalPriceBreakdown(!showModalPriceBreakdown)}
-                    activeOpacity={0.8}
-                  >
+                  <Text style={styles.modalSectionTitle}>💰 Resumen y Confirmación de Reserva</Text>
+                  <TouchableOpacity style={styles.modalPriceSummaryBox} onPress={() => setShowModalPriceBreakdown(!showModalPriceBreakdown)} activeOpacity={0.8}>
                     <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
                       <View>
-                        <Text style={{ fontSize: 13, color: '#4a5568', fontWeight: '600' }}>
-                          Total por {modalDurationHours} horas ({modalStartTime} - {modalEndTime})
-                        </Text>
+                        <Text style={{ fontSize: 13, color: '#4a5568', fontWeight: 'bold' }}>📅 {selectedGlobalDate.label}</Text>
+                        <Text style={{ fontSize: 13, color: '#4a5568', fontWeight: '600' }}>⏰ {modalDurationHours} hrs ({selectedGlobalStartTime} - {selectedGlobalEndTime})</Text>
                         <Text style={styles.modalPriceText}>{formatCLP(modalTotalAmount)}</Text>
                       </View>
                       <View style={styles.expandPill}>
-                        <Text style={styles.expandPillText}>
-                          {showModalPriceBreakdown ? 'Ocultar ▲' : 'Ver detalle ▼'}
-                        </Text>
+                        <Text style={styles.expandPillText}>{showModalPriceBreakdown ? 'Ocultar ▲' : 'Ver detalle ▼'}</Text>
                       </View>
                     </View>
 
@@ -1200,10 +938,6 @@ export default function ParentHomeScreen() {
                         <View style={styles.breakdownRow}>
                           <Text style={styles.breakdownLabel}>Tarifa por hora de {selectedSitter.first_name}:</Text>
                           <Text style={styles.breakdownValue}>{formatCLP(modalHourlyRate)}/hr</Text>
-                        </View>
-                        <View style={styles.breakdownRow}>
-                          <Text style={styles.breakdownLabel}>Tiempo seleccionado:</Text>
-                          <Text style={styles.breakdownValue}>{modalDurationHours} horas</Text>
                         </View>
                         <View style={styles.breakdownRow}>
                           <Text style={styles.breakdownLabel}>Pago directo a la niñera (70%):</Text>
@@ -1223,18 +957,8 @@ export default function ParentHomeScreen() {
               </ScrollView>
 
               <View style={styles.modalActions}>
-                <TouchableOpacity 
-                  style={[styles.requestButton, requestingId === selectedSitter.id && styles.requestButtonDisabled]} 
-                  onPress={() => confirmRequestBabysitter(selectedSitter.id)}
-                  disabled={requestingId === selectedSitter.id}
-                >
-                  {requestingId === selectedSitter.id ? (
-                    <ActivityIndicator color="#fff" />
-                  ) : (
-                    <Text style={styles.requestButtonText}>
-                      ✨ Solicitar por {formatCLP(modalTotalAmount)}
-                    </Text>
-                  )}
+                <TouchableOpacity style={[styles.requestButton, requestingId === selectedSitter.id && styles.requestButtonDisabled]} onPress={() => confirmRequestBabysitter(selectedSitter.id)} disabled={requestingId === selectedSitter.id}>
+                  {requestingId === selectedSitter.id ? <ActivityIndicator color="#fff" /> : <Text style={styles.requestButtonText}>✨ Solicitar por {formatCLP(modalTotalAmount)}</Text>}
                 </TouchableOpacity>
                 <TouchableOpacity style={styles.closeModalButton} onPress={() => setSelectedSitter(null)}>
                   <Text style={styles.closeModalText}>Cerrar</Text>
@@ -1251,10 +975,7 @@ export default function ParentHomeScreen() {
             <View style={styles.modalContent}>
               <ScrollView showsVerticalScrollIndicator={false}>
                 <Text style={styles.modalName}>Calificar Niñera</Text>
-                <Text style={{ textAlign: 'center', color: '#718096', marginBottom: 20 }}>
-                  ¿Cómo fue tu experiencia con el servicio?
-                </Text>
-
+                <Text style={{ textAlign: 'center', color: '#718096', marginBottom: 20 }}>¿Cómo fue tu experiencia con el servicio?</Text>
                 <View style={styles.modalSection}>
                   <Text style={styles.modalSectionTitle}>Selecciona tu Calificación</Text>
                   <View style={styles.starsRow}>
@@ -1265,19 +986,11 @@ export default function ParentHomeScreen() {
                     ))}
                   </View>
                 </View>
-
                 <View style={styles.modalSection}>
                   <Text style={styles.modalSectionTitle}>Comentario (Opcional)</Text>
-                  <TextInput
-                    style={[styles.input, styles.textArea]}
-                    placeholder="Ej: Muy atenta y puntual..."
-                    value={reviewComment}
-                    onChangeText={setReviewComment}
-                    multiline
-                  />
+                  <TextInput style={[styles.input, styles.textArea]} placeholder="Ej: Muy atenta y puntual..." value={reviewComment} onChangeText={setReviewComment} multiline />
                 </View>
               </ScrollView>
-
               <View style={styles.modalActions}>
                 <TouchableOpacity style={[styles.requestButton, { backgroundColor: '#38a169' }]} onPress={submitReview} disabled={submittingReview}>
                   {submittingReview ? <ActivityIndicator color="#fff" /> : <Text style={styles.requestButtonText}>Publicar Calificación</Text>}
@@ -1301,23 +1014,17 @@ export default function ParentHomeScreen() {
                   <Text style={{ fontSize: 24, color: '#718096' }}>×</Text>
                 </TouchableOpacity>
               </View>
-
               {unreadNotificationsCount > 0 && (
                 <TouchableOpacity onPress={markAllNotificationsAsRead} style={{ marginBottom: 12, alignSelf: 'flex-end' }}>
                   <Text style={{ color: '#3182ce', fontWeight: 'bold' }}>Marcar todas como leídas</Text>
                 </TouchableOpacity>
               )}
-
               <ScrollView showsVerticalScrollIndicator={false} style={{ maxHeight: 400 }}>
                 {notifications.length === 0 ? (
                   <Text style={styles.emptyText}>No tienes notificaciones.</Text>
                 ) : (
                   notifications.map((notif) => (
-                    <TouchableOpacity 
-                      key={notif.id} 
-                      style={[styles.notificationCard, !notif.is_read && styles.notificationUnread]} 
-                      onPress={() => markNotificationAsRead(notif.id)}
-                    >
+                    <TouchableOpacity key={notif.id} style={[styles.notificationCard, !notif.is_read && styles.notificationUnread]} onPress={() => markNotificationAsRead(notif.id)}>
                       <View style={styles.notificationHeaderRow}>
                         <Text style={styles.notificationTitle}>{notif.title}</Text>
                         {!notif.is_read && <View style={styles.unreadDot} />}
@@ -1343,7 +1050,6 @@ export default function ParentHomeScreen() {
                   <Text style={{ fontSize: 24, color: '#718096' }}>×</Text>
                 </TouchableOpacity>
               </View>
-              
               <ScrollView style={styles.chatScroll} contentContainerStyle={{ padding: 16 }}>
                 {messages.length === 0 ? (
                   <Text style={styles.emptyText}>No hay mensajes en esta conversación. ¡Di hola!</Text>
@@ -1352,22 +1058,14 @@ export default function ParentHomeScreen() {
                     const isMe = msg.sender_id !== activeChatSitter?.id; 
                     return (
                       <View key={msg.id || idx} style={[styles.messageBubble, isMe ? styles.messageMe : styles.messageThem]}>
-                        <Text style={[styles.messageText, isMe ? styles.messageTextMe : styles.messageTextThem]}>
-                          {msg.content}
-                        </Text>
+                        <Text style={[styles.messageText, isMe ? styles.messageTextMe : styles.messageTextThem]}>{msg.content}</Text>
                       </View>
                     );
                   })
                 )}
               </ScrollView>
-              
               <View style={styles.chatInputRow}>
-                <TextInput 
-                  style={styles.chatInput} 
-                  placeholder="Escribe un mensaje..." 
-                  value={newMessage} 
-                  onChangeText={setNewMessage} 
-                />
+                <TextInput style={styles.chatInput} placeholder="Escribe un mensaje..." value={newMessage} onChangeText={setNewMessage} />
                 <TouchableOpacity style={styles.chatSendButton} onPress={sendMessage} disabled={sendingMessage}>
                   {sendingMessage ? <ActivityIndicator color="#fff" size="small" /> : <Text style={styles.chatSendButtonText}>Enviar</Text>}
                 </TouchableOpacity>
@@ -1401,14 +1099,20 @@ const styles = StyleSheet.create({
   activeTabText: { color: '#2b6cb0' },
   contentArea: { width: '100%', maxWidth: 500, alignItems: 'center' },
 
-  filtersContainer: { width: '100%', backgroundColor: '#ffffff', padding: 16, borderRadius: 12, marginBottom: 24, borderWidth: 1, borderColor: '#e2e8f0' },
+  filtersContainer: { width: '100%', backgroundColor: '#ffffff', padding: 16, borderRadius: 12, marginBottom: 12, borderWidth: 1, borderColor: '#e2e8f0' },
   filterSection: { marginBottom: 16 },
   filterLabel: { fontSize: 14, fontWeight: 'bold', color: '#4a5568', marginBottom: 10, paddingHorizontal: 4 },
   filterScroll: { gap: 8, paddingBottom: 4 },
+  
+  // NUEVO: FASE 2 RESPONSIVIDAD (flexWrap en vez de ScrollView horizontal)
+  wrapContainer: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+
   filterChip: { paddingVertical: 8, paddingHorizontal: 16, borderRadius: 20, backgroundColor: '#edf2f7', borderWidth: 1, borderColor: '#cbd5e0' },
   filterChipSelected: { backgroundColor: '#ebf8ff', borderColor: '#3182ce' },
   filterChipText: { fontSize: 14, fontWeight: '600', color: '#4a5568' },
   filterChipTextSelected: { color: '#2b6cb0' },
+
+  resultsSummary: { fontSize: 13, color: '#3182ce', fontWeight: 'bold', marginBottom: 16, alignSelf: 'flex-start', paddingHorizontal: 4 },
 
   listContainer: { width: '100%', marginBottom: 32 },
   card: { width: '100%', backgroundColor: '#fff', padding: 20, borderRadius: 12, marginBottom: 16, borderWidth: 1, borderColor: '#e2e8f0' },
@@ -1443,7 +1147,6 @@ const styles = StyleSheet.create({
   acceptedBannerTitle: { fontSize: 16, fontWeight: 'bold', color: '#22543d', marginBottom: 4 },
   acceptedBannerSub: { fontSize: 14, color: '#2f855a', textAlign: 'center' },
 
-  // Estilos del desglose expandible
   breakdownToggleBtn: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', width: '100%', backgroundColor: '#ebf8ff', borderWidth: 1, borderColor: '#bee3f8', paddingVertical: 10, paddingHorizontal: 12, borderRadius: 8, marginBottom: 8 },
   breakdownToggleText: { fontSize: 14, fontWeight: 'bold', color: '#2b6cb0' },
   breakdownToggleArrow: { fontSize: 12, fontWeight: '600', color: '#3182ce' },
@@ -1484,8 +1187,6 @@ const styles = StyleSheet.create({
   cancelAcceptedButtonText: { color: '#ffffff', fontWeight: 'bold', fontSize: 12 },
   statusBoxRejected: { backgroundColor: '#fed7d7' },
   statusBoxTextRejected: { color: '#9b2c2c', fontWeight: '600', fontSize: 14, textAlign: 'center', marginBottom: 8 },
-  dismissButton: { backgroundColor: '#718096', paddingVertical: 6, paddingHorizontal: 12, borderRadius: 6 },
-  dismissButtonText: { color: '#ffffff', fontWeight: 'bold', fontSize: 13 },
   
   badge: { paddingVertical: 4, paddingHorizontal: 10, borderRadius: 12, fontSize: 12, fontWeight: 'bold', overflow: 'hidden' },
   badgeAccepted: { backgroundColor: '#c6f6d5', color: '#22543d' },

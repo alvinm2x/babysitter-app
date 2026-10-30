@@ -18,7 +18,7 @@ import {
 const AVAILABLE_ZONES = ['Santiago Centro', 'Las Condes', 'Providencia', 'Vitacura'];
 const DAYS = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo'];
 const SHIFTS = ['Mañana', 'Tarde', 'Noche'];
-const PLATFORM_COMMISSION_RATE = 0.30; // 30% comisión MVP
+const PLATFORM_COMMISSION_RATE = 0.30;
 
 const showAlert = (title: string, message: string) => {
   if (Platform.OS === 'web') {
@@ -46,7 +46,6 @@ const buildGoogleCalendarDates = (jobDate?: string, jobTime?: string) => {
   return '&dates=' + ymd + 'T' + startH + startM + '00/' + ymd + 'T' + endH + endM + '00';
 };
 
-// Función para formatear a CLP (ej: "10000" -> "$10.000 CLP")
 const formatCLP = (amount: number | string) => {
   const num = Number(amount) || 0;
   return '$' + new Intl.NumberFormat('es-CL').format(Math.round(num)) + ' CLP';
@@ -82,7 +81,6 @@ export default function BabysitterHomeScreen() {
   const [savingProfile, setSavingProfile] = useState(false);
   
   const [expandedBreakdownIds, setExpandedBreakdownIds] = useState<{ [key: string]: boolean }>({});
-
   const [isSaved, setIsSaved] = useState(false);
 
   const [firstName, setFirstName] = useState('');
@@ -123,31 +121,20 @@ export default function BabysitterHomeScreen() {
       const { data: { user } } = await supabase.auth.getUser();
 
       if (user) {
-        reqSubscription = supabase
-          .channel('babysitter_realtime_requests')
-          .on(
-            'postgres_changes',
-            {
-              event: '*',
-              schema: 'public',
-              table: 'job_requests',
-              filter: 'babysitter_id=eq.' + user.id,
-            },
-            () => {
-              fetchRequests();
-            }
-          )
+        // CORRECCIÓN REALTIME: Limpiamos los canales antes de suscribirnos (útil para Hot-Reload en localhost)
+        supabase.removeChannel(supabase.channel('babysitter_realtime_requests'));
+        supabase.removeChannel(supabase.channel('babysitter_realtime_notifs'));
+
+        reqSubscription = supabase.channel('babysitter_realtime_requests')
+          .on('postgres_changes', { event: '*', schema: 'public', table: 'job_requests', filter: 'babysitter_id=eq.' + user.id }, () => {
+            fetchRequests();
+          })
           .subscribe();
 
-        notifSubscription = supabase
-          .channel('babysitter_realtime_notifs')
-          .on(
-            'postgres_changes',
-            { event: '*', schema: 'public', table: 'notifications', filter: 'user_id=eq.' + user.id },
-            () => {
-              loadNotifications();
-            }
-          )
+        notifSubscription = supabase.channel('babysitter_realtime_notifs')
+          .on('postgres_changes', { event: '*', schema: 'public', table: 'notifications', filter: 'user_id=eq.' + user.id }, () => {
+            loadNotifications();
+          })
           .subscribe();
       }
     };
@@ -165,15 +152,12 @@ export default function BabysitterHomeScreen() {
 
     if (isChatOpen && activeRequestId) {
       loadMessages(activeRequestId);
+      supabase.removeChannel(supabase.channel('chat_' + activeRequestId));
 
       chatSub = supabase.channel('chat_' + activeRequestId)
-        .on(
-          'postgres_changes',
-          { event: 'INSERT', schema: 'public', table: 'messages', filter: 'request_id=eq.' + activeRequestId },
-          (payload) => {
-            setMessages((prev) => [...prev, payload.new]);
-          }
-        )
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: 'request_id=eq.' + activeRequestId }, (payload) => {
+          setMessages((prev) => [...prev, payload.new]);
+        })
         .subscribe();
     }
 
@@ -184,14 +168,8 @@ export default function BabysitterHomeScreen() {
 
   const loadMessages = async (reqId: string) => {
     try {
-      const { data, error } = await supabase
-        .from('messages')
-        .select('*')
-        .eq('request_id', reqId)
-        .order('created_at', { ascending: true });
-      if (!error && data) {
-        setMessages(data);
-      }
+      const { data, error } = await supabase.from('messages').select('*').eq('request_id', reqId).order('created_at', { ascending: true });
+      if (!error && data) setMessages(data);
     } catch (err) {
       console.error(err);
     }
@@ -203,19 +181,10 @@ export default function BabysitterHomeScreen() {
     try {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) return;
-      
-      const { error } = await supabase.from('messages').insert([{
-        request_id: activeRequestId,
-        sender_id: user.id,
-        receiver_id: activeChatParent.id,
-        content: newMessage.trim()
-      }]);
+      const { error } = await supabase.from('messages').insert([{ request_id: activeRequestId, sender_id: user.id, receiver_id: activeChatParent.id, content: newMessage.trim() }]);
       if (error) throw error;
-      
       setNewMessage('');
-      
       await sendNotificationToParent(activeChatParent.id, "💬 Nuevo Mensaje", "La niñera te ha respondido en el chat de la app.");
-
     } catch (err: any) {
       showAlert("Error al enviar", err.message);
     } finally {
@@ -226,11 +195,7 @@ export default function BabysitterHomeScreen() {
   const sendNotificationToParent = async (parentId: string, title: string, message: string) => {
     if (!parentId) return;
     try {
-      await supabase.from('notifications').insert([{
-        user_id: parentId,
-        title: title,
-        message: message
-      }]);
+      await supabase.from('notifications').insert([{ user_id: parentId, title: title, message: message }]);
     } catch (err) {
       console.error("Error al enviar notificación al padre", err);
     }
@@ -240,14 +205,8 @@ export default function BabysitterHomeScreen() {
     try {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) return;
-      const { data, error } = await supabase
-        .from('notifications')
-        .select('*')
-        .eq('user_id', user.id)
-        .order('created_at', { ascending: false });
-      if (!error && data) {
-        setNotifications(data);
-      }
+      const { data, error } = await supabase.from('notifications').select('*').eq('user_id', user.id).order('created_at', { ascending: false });
+      if (!error && data) setNotifications(data);
     } catch (err) {
       console.error(err);
     }
@@ -279,12 +238,7 @@ export default function BabysitterHomeScreen() {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) return;
 
-      const { data: reqs, error: reqError } = await supabase
-        .from('job_requests')
-        .select('*')
-        .eq('babysitter_id', user.id)
-        .order('created_at', { ascending: false });
-
+      const { data: reqs, error: reqError } = await supabase.from('job_requests').select('*').eq('babysitter_id', user.id).order('created_at', { ascending: false });
       if (reqError) throw reqError;
       if (!reqs || reqs.length === 0) {
         setRequests([]);
@@ -293,26 +247,16 @@ export default function BabysitterHomeScreen() {
       }
 
       const parentIds = Array.from(new Set(reqs.map((r) => r.parent_id).filter(Boolean)));
-
       let profilesMap: { [key: string]: any } = {};
+      
       if (parentIds.length > 0) {
-        const { data: profiles, error: profError } = await supabase
-          .from('parent_profiles')
-          .select('id, phone, address, children_info, emergency_contact')
-          .in('id', parentIds);
-
+        const { data: profiles, error: profError } = await supabase.from('parent_profiles').select('id, phone, address, children_info, emergency_contact').in('id', parentIds);
         if (!profError && profiles) {
-          profiles.forEach((p) => {
-            profilesMap[p.id] = p;
-          });
+          profiles.forEach((p) => { profilesMap[p.id] = p; });
         }
       }
 
-      const combined = reqs.map((r) => ({
-        ...r,
-        parent_profiles: profilesMap[r.parent_id] || {},
-      }));
-
+      const combined = reqs.map((r) => ({ ...r, parent_profiles: profilesMap[r.parent_id] || {} }));
       setRequests(combined);
     } catch (error: any) {
       console.error('Error al obtener solicitudes:', error.message);
@@ -321,33 +265,18 @@ export default function BabysitterHomeScreen() {
     }
   };
 
-  const handleUpdateStatus = async (
-    requestId: string,
-    parentId: string,
-    newStatus: 'accepted' | 'rejected' | 'completed'
-  ) => {
+  const handleUpdateStatus = async (requestId: string, parentId: string, newStatus: 'accepted' | 'rejected' | 'completed') => {
     setUpdatingId(requestId);
     try {
-      
       const updateData: any = { status: newStatus };
-      if (newStatus === 'accepted') {
-        updateData.payment_status = 'held';
-      } else if (newStatus === 'completed') {
-        updateData.payment_status = 'ready_for_payout';
-      } else if (newStatus === 'rejected') {
-        updateData.payment_status = 'refunded';
-      }
+      if (newStatus === 'accepted') updateData.payment_status = 'held';
+      else if (newStatus === 'completed') updateData.payment_status = 'ready_for_payout';
+      else if (newStatus === 'rejected') updateData.payment_status = 'refunded';
 
-      const { error } = await supabase
-        .from('job_requests')
-        .update(updateData)
-        .eq('id', requestId);
-
+      const { error } = await supabase.from('job_requests').update(updateData).eq('id', requestId);
       if (error) throw error;
 
-      setRequests((prev) =>
-        prev.map((req) => (req.id === requestId ? { ...req, status: newStatus, payment_status: updateData.payment_status } : req))
-      );
+      setRequests((prev) => prev.map((req) => (req.id === requestId ? { ...req, status: newStatus, payment_status: updateData.payment_status } : req)));
 
       if (newStatus === 'accepted') {
         await sendNotificationToParent(parentId, "Solicitud Aceptada 🎉", "¡La niñera ha aceptado tu solicitud! Ya pueden coordinar por el chat.");
@@ -386,42 +315,21 @@ export default function BabysitterHomeScreen() {
   const loadProfile = async () => {
     setLoadingProfile(true);
     const { data: { session } } = await supabase.auth.getSession();
-    if (!session) {
-      setLoadingProfile(false);
-      return;
-    }
+    if (!session) { setLoadingProfile(false); return; }
 
-    const { data } = await supabase
-      .from('babysitter_profiles')
-      .select('*')
-      .eq('id', session.user.id)
-      .maybeSingle();
-
+    const { data } = await supabase.from('babysitter_profiles').select('*').eq('id', session.user.id).maybeSingle();
     if (data) {
       setFirstName(data.first_name || '');
       setLastName(data.last_name || '');
       setBio(data.bio || '');
-      
-      if (data.hourly_rate) {
-        setHourlyRate(formatCurrencyInput(data.hourly_rate.toString()));
-      }
-
+      if (data.hourly_rate) setHourlyRate(formatCurrencyInput(data.hourly_rate.toString()));
       setExperience(data.experience_years ? data.experience_years.toString() : '');
-
       if (data.location_zone) {
-        const zones = Array.isArray(data.location_zone)
-          ? data.location_zone
-          : data.location_zone.split(',').map((z: string) => z.trim());
+        const zones = Array.isArray(data.location_zone) ? data.location_zone : data.location_zone.split(',').map((z: string) => z.trim());
         setSelectedZones(zones);
       }
-
-      if (data.available_days) {
-        setAvailableDays(data.available_days);
-      }
-
-      if (data.available_shifts) {
-        setAvailableShifts(data.available_shifts);
-      }
+      if (data.available_days) setAvailableDays(data.available_days);
+      if (data.available_shifts) setAvailableShifts(data.available_shifts);
     }
     setLoadingProfile(false);
   };
@@ -431,14 +339,11 @@ export default function BabysitterHomeScreen() {
       showAlert('Error', 'Por favor completa todos los campos de texto.');
       return;
     }
-
     if (selectedZones.length === 0 || availableDays.length === 0 || availableShifts.length === 0) {
       showAlert('Error', 'Debes seleccionar al menos una Comuna, un Día y un Horario.');
       return;
     }
-
     const numericRate = Number(hourlyRate.replace(/\D/g, ''));
-    
     if (numericRate < 10000) {
       showAlert('Tarifa muy baja', 'La tarifa mínima por hora debe ser de al menos $10.000 CLP.');
       return;
@@ -446,11 +351,7 @@ export default function BabysitterHomeScreen() {
 
     setSavingProfile(true);
     const { data: { session } } = await supabase.auth.getSession();
-
-    if (!session) {
-      setSavingProfile(false);
-      return;
-    }
+    if (!session) { setSavingProfile(false); return; }
 
     const updates = {
       id: session.user.id,
@@ -466,7 +367,6 @@ export default function BabysitterHomeScreen() {
     };
 
     const { error } = await supabase.from('babysitter_profiles').upsert(updates);
-
     setSavingProfile(false);
 
     if (error) {
@@ -478,17 +378,9 @@ export default function BabysitterHomeScreen() {
     }
   };
 
-  const toggleZone = (zone: string) => {
-    setSelectedZones((prev) => prev.includes(zone) ? prev.filter((z) => z !== zone) : [...prev, zone]);
-  };
-
-  const toggleDay = (day: string) => {
-    setAvailableDays((prev) => prev.includes(day) ? prev.filter((d) => d !== day) : [...prev, day]);
-  };
-
-  const toggleShift = (shift: string) => {
-    setAvailableShifts((prev) => prev.includes(shift) ? prev.filter((s) => s !== shift) : [...prev, shift]);
-  };
+  const toggleZone = (zone: string) => { setSelectedZones((prev) => prev.includes(zone) ? prev.filter((z) => z !== zone) : [...prev, zone]); };
+  const toggleDay = (day: string) => { setAvailableDays((prev) => prev.includes(day) ? prev.filter((d) => d !== day) : [...prev, day]); };
+  const toggleShift = (shift: string) => { setAvailableShifts((prev) => prev.includes(shift) ? prev.filter((s) => s !== shift) : [...prev, shift]); };
 
   const handleSignOut = async () => {
     setLoadingAuth(true);
@@ -497,28 +389,16 @@ export default function BabysitterHomeScreen() {
     if (!error) router.replace('/');
   };
 
-  const activeRequests = requests.filter((req) => {
-    const s = String(req.status || '').toLowerCase().trim();
-    return s !== 'completed' && s !== 'rejected' && s !== 'dismissed';
-  });
-
-  const historyRequests = requests.filter((req) => {
-    const s = String(req.status || '').toLowerCase().trim();
-    return s === 'completed' || s === 'rejected' || s === 'dismissed';
-  });
-
+  const activeRequests = requests.filter((req) => { const s = String(req.status || '').toLowerCase().trim(); return s !== 'completed' && s !== 'rejected' && s !== 'dismissed'; });
+  const historyRequests = requests.filter((req) => { const s = String(req.status || '').toLowerCase().trim(); return s === 'completed' || s === 'rejected' || s === 'dismissed'; });
   const unreadNotificationsCount = notifications.filter(n => !n.is_read).length;
 
   const getPaymentStatusBadge = (paymentStatus?: string) => {
     switch (paymentStatus) {
-      case 'held':
-        return { label: '🔒 Fondos retenidos seguros', color: '#c05621', bg: '#feebc8' };
-      case 'ready_for_payout':
-        return { label: '⏳ En proceso de transferencia a tu cuenta', color: '#2b6cb0', bg: '#ebf8ff' };
-      case 'paid_out':
-        return { label: '✅ Pago transferido', color: '#22543d', bg: '#c6f6d5' };
-      default:
-        return { label: '💳 Esperando confirmación', color: '#744210', bg: '#fefcbf' };
+      case 'held': return { label: '🔒 Fondos retenidos seguros', color: '#c05621', bg: '#feebc8' };
+      case 'ready_for_payout': return { label: '⏳ En proceso de transferencia a tu cuenta', color: '#2b6cb0', bg: '#ebf8ff' };
+      case 'paid_out': return { label: '✅ Pago transferido', color: '#22543d', bg: '#c6f6d5' };
+      default: return { label: '💳 Esperando confirmación', color: '#744210', bg: '#fefcbf' };
     }
   };
 
@@ -593,17 +473,9 @@ export default function BabysitterHomeScreen() {
                         </View>
                       )}
 
-                      {/* DESGLOSE EXPANDIBLE DE GANANCIAS */}
-                      <TouchableOpacity 
-                        style={styles.breakdownToggleBtn} 
-                        onPress={() => toggleBreakdown(req.id)}
-                      >
-                        <Text style={styles.breakdownToggleText}>
-                          💳 Ganancia Líquida: {formatCLP(reqNet)}
-                        </Text>
-                        <Text style={styles.breakdownToggleArrow}>
-                          {isExpanded ? 'Ocultar desglose ▲' : 'Ver detalle ▼'}
-                        </Text>
+                      <TouchableOpacity style={styles.breakdownToggleBtn} onPress={() => toggleBreakdown(req.id)}>
+                        <Text style={styles.breakdownToggleText}>💳 Ganancia Líquida: {formatCLP(reqNet)}</Text>
+                        <Text style={styles.breakdownToggleArrow}>{isExpanded ? 'Ocultar desglose ▲' : 'Ver detalle ▼'}</Text>
                       </TouchableOpacity>
 
                       {isExpanded && (
@@ -632,9 +504,7 @@ export default function BabysitterHomeScreen() {
                       {isAccepted && (
                         <View style={styles.acceptedBanner}>
                           <Text style={styles.acceptedBannerTitle}>🎉 ¡Servicio Confirmado!</Text>
-                          <Text style={styles.acceptedBannerSub}>
-                            Agendado para el <Text style={{ fontWeight: 'bold' }}>{req.job_date}</Text>.
-                          </Text>
+                          <Text style={styles.acceptedBannerSub}>Agendado para el <Text style={{ fontWeight: 'bold' }}>{req.job_date}</Text>.</Text>
                         </View>
                       )}
 
@@ -644,17 +514,11 @@ export default function BabysitterHomeScreen() {
                           <Text style={styles.contactText}>🏠 Dirección: {parentInfo.address || 'No especificada'}</Text>
                           <Text style={styles.contactText}>👶 Niños: {parentInfo.children_info || 'No especificado'}</Text>
                           <Text style={styles.contactText}>📞 Teléfono: {parentInfo.phone || 'No especificado'}</Text>
-                          {parentInfo.emergency_contact ? (
-                            <Text style={styles.contactText}>🚨 Emergencia: {parentInfo.emergency_contact}</Text>
-                          ) : null}
+                          {parentInfo.emergency_contact ? <Text style={styles.contactText}>🚨 Emergencia: {parentInfo.emergency_contact}</Text> : null}
                           
                           <TouchableOpacity 
                             style={styles.chatAppButton} 
-                            onPress={() => { 
-                              setActiveChatParent({ id: req.parent_id, ...parentInfo }); 
-                              setActiveRequestId(req.id); 
-                              setIsChatOpen(true); 
-                            }}
+                            onPress={() => { setActiveChatParent({ id: req.parent_id, ...parentInfo }); setActiveRequestId(req.id); setIsChatOpen(true); }}
                           >
                             <Text style={styles.chatAppButtonText}>💬 Chat en la App</Text>
                           </TouchableOpacity>
@@ -671,16 +535,13 @@ export default function BabysitterHomeScreen() {
                         </View>
                       )}
 
-                      <Text style={styles.dateText}>
-                        Recibida el: {new Date(req.created_at).toLocaleDateString()}
-                      </Text>
+                      <Text style={styles.dateText}>Recibida el: {new Date(req.created_at).toLocaleDateString()}</Text>
 
                       {!isAccepted && (
                         <View style={styles.actionRow}>
                           <TouchableOpacity style={[styles.actionButton, styles.acceptButton]} onPress={() => handleUpdateStatus(req.id, req.parent_id, 'accepted')} disabled={isUpdatingThis}>
                             {isUpdatingThis ? <ActivityIndicator color="#fff" size="small" /> : <Text style={styles.actionButtonText}>Aceptar Trabajo</Text>}
                           </TouchableOpacity>
-
                           <TouchableOpacity style={[styles.actionButton, styles.rejectButton]} onPress={() => handleUpdateStatus(req.id, req.parent_id, 'rejected')} disabled={isUpdatingThis}>
                             <Text style={styles.actionButtonText}>Rechazar</Text>
                           </TouchableOpacity>
@@ -692,7 +553,6 @@ export default function BabysitterHomeScreen() {
                           <TouchableOpacity style={styles.completeButton} onPress={() => handleUpdateStatus(req.id, req.parent_id, 'completed')} disabled={isUpdatingThis}>
                             {isUpdatingThis ? <ActivityIndicator color="#fff" size="small" /> : <Text style={styles.completeButtonText}>✅ Marcar Trabajo como Completado</Text>}
                           </TouchableOpacity>
-
                           <TouchableOpacity style={[styles.actionButton, styles.rejectButton, { marginTop: 8 }]} onPress={() => handleUpdateStatus(req.id, req.parent_id, 'rejected')} disabled={isUpdatingThis}>
                             <Text style={styles.actionButtonText}>Cancelar Trabajo</Text>
                           </TouchableOpacity>
@@ -710,7 +570,6 @@ export default function BabysitterHomeScreen() {
           <View style={styles.contentArea}>
             <Text style={styles.historyTitle}>Historial de Ganancias</Text>
             <Text style={styles.historySubtitle}>Registro de servicios completados y cancelados.</Text>
-
             {loadingRequests ? (
               <ActivityIndicator size="large" color="#3182ce" style={{ marginVertical: 32 }} />
             ) : historyRequests.length === 0 ? (
@@ -739,29 +598,18 @@ export default function BabysitterHomeScreen() {
                           {isCompleted ? 'Completado' : isRejected ? 'Rechazado' : 'Cancelado'}
                         </Text>
                       </View>
-
                       {(req.job_date || req.job_time) && (
                         <View style={styles.jobDetailsBox}>
                           <Text style={styles.jobDetailsText}>📅 Fecha: {req.job_date || 'No especificado'}</Text>
                           <Text style={styles.jobDetailsText}>⏰ Horario: {req.job_time || 'No especificado'} ({histHours} hrs)</Text>
                         </View>
                       )}
-
-                      {/* DESGLOSE EXPANDIBLE EN HISTORIAL DE NIÑERA */}
                       {isCompleted && (
                         <>
-                          <TouchableOpacity 
-                            style={styles.breakdownToggleBtn} 
-                            onPress={() => toggleBreakdown('hist_' + req.id)}
-                          >
-                            <Text style={styles.breakdownToggleText}>
-                              💳 Ganancia Líquida: {formatCLP(histNet)}
-                            </Text>
-                            <Text style={styles.breakdownToggleArrow}>
-                              {isHistExpanded ? 'Ocultar desglose ▲' : 'Ver detalle ▼'}
-                            </Text>
+                          <TouchableOpacity style={styles.breakdownToggleBtn} onPress={() => toggleBreakdown('hist_' + req.id)}>
+                            <Text style={styles.breakdownToggleText}>💳 Ganancia Líquida: {formatCLP(histNet)}</Text>
+                            <Text style={styles.breakdownToggleArrow}>{isHistExpanded ? 'Ocultar desglose ▲' : 'Ver detalle ▼'}</Text>
                           </TouchableOpacity>
-
                           {isHistExpanded && (
                             <View style={styles.breakdownCard}>
                               <View style={styles.breakdownRow}>
@@ -784,17 +632,13 @@ export default function BabysitterHomeScreen() {
                           )}
                         </>
                       )}
-
                       {isCompleted && (
                         <View style={styles.parentContactBox}>
                           <Text style={styles.contactBoxTitle}>📍 Familia atendida</Text>
                           <Text style={styles.contactText}>🏠 Dirección: {parentInfo.address || 'No especificada'}</Text>
                         </View>
                       )}
-
-                      <Text style={styles.dateText}>
-                        Fecha de solicitud: {new Date(req.created_at).toLocaleDateString()}
-                      </Text>
+                      <Text style={styles.dateText}>Fecha de solicitud: {new Date(req.created_at).toLocaleDateString()}</Text>
                     </View>
                   );
                 })}
@@ -909,13 +753,11 @@ export default function BabysitterHomeScreen() {
                   <Text style={{ fontSize: 24, color: '#718096' }}>×</Text>
                 </TouchableOpacity>
               </View>
-
               {unreadNotificationsCount > 0 && (
                 <TouchableOpacity onPress={markAllNotificationsAsRead} style={{ marginBottom: 12, alignSelf: 'flex-end' }}>
                   <Text style={{ color: '#3182ce', fontWeight: 'bold' }}>Marcar todas como leídas</Text>
                 </TouchableOpacity>
               )}
-
               <ScrollView showsVerticalScrollIndicator={false} style={{ maxHeight: 400 }}>
                 {notifications.length === 0 ? (
                   <Text style={styles.emptyText}>No tienes notificaciones.</Text>
@@ -951,7 +793,6 @@ export default function BabysitterHomeScreen() {
                   <Text style={{ fontSize: 24, color: '#718096' }}>×</Text>
                 </TouchableOpacity>
               </View>
-              
               <ScrollView style={styles.chatScroll} contentContainerStyle={{ padding: 16 }}>
                 {messages.length === 0 ? (
                   <Text style={styles.emptyText}>No hay mensajes en esta conversación. ¡Di hola!</Text>
@@ -968,14 +809,8 @@ export default function BabysitterHomeScreen() {
                   })
                 )}
               </ScrollView>
-              
               <View style={styles.chatInputRow}>
-                <TextInput 
-                  style={styles.chatInput} 
-                  placeholder="Escribe un mensaje..." 
-                  value={newMessage} 
-                  onChangeText={setNewMessage} 
-                />
+                <TextInput style={styles.chatInput} placeholder="Escribe un mensaje..." value={newMessage} onChangeText={setNewMessage} />
                 <TouchableOpacity style={styles.chatSendButton} onPress={sendMessage} disabled={sendingMessage}>
                   {sendingMessage ? <ActivityIndicator color="#fff" size="small" /> : <Text style={styles.chatSendButtonText}>Enviar</Text>}
                 </TouchableOpacity>
@@ -992,84 +827,31 @@ export default function BabysitterHomeScreen() {
 const styles = StyleSheet.create({
   mainWrapper: { flex: 1, backgroundColor: '#f7fafc' },
   container: { flexGrow: 1, alignItems: 'center', paddingTop: 24, paddingBottom: 40 },
-  
   headerContainer: { flexDirection: 'row', width: '100%', maxWidth: 500, justifyContent: 'space-between', alignItems: 'flex-start', paddingHorizontal: 24 },
   title: { fontSize: 28, fontWeight: 'bold', color: '#1a202c', marginBottom: 4 },
   subtitle: { fontSize: 15, color: '#718096', marginBottom: 20 },
-  
   bellButton: { position: 'relative', padding: 8, backgroundColor: '#edf2f7', borderRadius: 20, marginTop: 4 },
   bellIcon: { fontSize: 20 },
   badgeCount: { position: 'absolute', top: -2, right: -4, backgroundColor: '#e53e3e', borderRadius: 10, width: 20, height: 20, justifyContent: 'center', alignItems: 'center', borderWidth: 2, borderColor: '#f7fafc' },
   badgeCountText: { color: '#fff', fontSize: 10, fontWeight: 'bold' },
-
-  tabContainer: {
-    flexDirection: 'row',
-    backgroundColor: '#e2e8f0',
-    borderRadius: 8,
-    padding: 4,
-    marginBottom: 24,
-    width: '100%',
-    maxWidth: 500,
-    alignSelf: 'center',
-  },
+  tabContainer: { flexDirection: 'row', backgroundColor: '#e2e8f0', borderRadius: 8, padding: 4, marginBottom: 24, width: '100%', maxWidth: 500, alignSelf: 'center' },
   tab: { flex: 1, paddingVertical: 10, alignItems: 'center', borderRadius: 6 },
   activeTab: { backgroundColor: '#fff', elevation: 2 },
   tabText: { fontSize: 14, fontWeight: '600', color: '#718096' },
   activeTabText: { color: '#2b6cb0' },
   contentArea: { width: '100%', maxWidth: 500, alignItems: 'center', paddingHorizontal: 24 },
-
-  historyTitle: {
-    fontSize: 20,
-    fontWeight: 'bold',
-    color: '#2d3748',
-    marginBottom: 4,
-    alignSelf: 'flex-start',
-  },
-  historySubtitle: {
-    fontSize: 14,
-    color: '#718096',
-    marginBottom: 20,
-    alignSelf: 'flex-start',
-  },
-
+  historyTitle: { fontSize: 20, fontWeight: 'bold', color: '#2d3748', marginBottom: 4, alignSelf: 'flex-start' },
+  historySubtitle: { fontSize: 14, color: '#718096', marginBottom: 20, alignSelf: 'flex-start' },
   listContainer: { width: '100%', marginBottom: 32 },
-  card: {
-    width: '100%',
-    backgroundColor: '#fff',
-    padding: 20,
-    borderRadius: 12,
-    marginBottom: 16,
-    borderWidth: 1,
-    borderColor: '#e2e8f0',
-  },
-  cardHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 12,
-  },
+  card: { width: '100%', backgroundColor: '#fff', padding: 20, borderRadius: 12, marginBottom: 16, borderWidth: 1, borderColor: '#e2e8f0' },
+  cardHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
   requestId: { fontSize: 16, fontWeight: 'bold', color: '#2d3748' },
-  badge: {
-    paddingVertical: 4,
-    paddingHorizontal: 10,
-    borderRadius: 12,
-    fontSize: 12,
-    fontWeight: 'bold',
-    overflow: 'hidden',
-  },
+  badge: { paddingVertical: 4, paddingHorizontal: 10, borderRadius: 12, fontSize: 12, fontWeight: 'bold', overflow: 'hidden' },
   badgePending: { backgroundColor: '#feebc8', color: '#c05621' },
   badgeAccepted: { backgroundColor: '#c6f6d5', color: '#22543d' },
   badgeRejected: { backgroundColor: '#fed7d7', color: '#9b2c2c' },
-
-  jobDetailsBox: {
-    backgroundColor: '#ebf8ff',
-    padding: 12,
-    borderRadius: 8,
-    marginBottom: 12,
-  },
+  jobDetailsBox: { backgroundColor: '#ebf8ff', padding: 12, borderRadius: 8, marginBottom: 12 },
   jobDetailsText: { fontSize: 14, color: '#2b6cb0', fontWeight: '600' },
-
-  // Estilos del desglose expandible de niñera
   breakdownToggleBtn: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', width: '100%', backgroundColor: '#f0fff4', borderWidth: 1, borderColor: '#c6f6d5', paddingVertical: 10, paddingHorizontal: 12, borderRadius: 8, marginBottom: 8 },
   breakdownToggleText: { fontSize: 14, fontWeight: 'bold', color: '#2f855a' },
   breakdownToggleArrow: { fontSize: 12, fontWeight: '600', color: '#38a169' },
@@ -1082,174 +864,52 @@ const styles = StyleSheet.create({
   breakdownDivider: { height: 1, backgroundColor: '#e2e8f0', marginVertical: 6 },
   paymentStatusPill: { marginTop: 8, paddingVertical: 6, paddingHorizontal: 10, borderRadius: 6, alignItems: 'center' },
   paymentStatusPillText: { fontSize: 12, fontWeight: 'bold' },
-
-  acceptedBanner: {
-    backgroundColor: '#c6f6d5',
-    borderWidth: 1,
-    borderColor: '#9ae6b4',
-    padding: 12,
-    borderRadius: 8,
-    marginBottom: 12,
-    alignItems: 'center',
-  },
+  acceptedBanner: { backgroundColor: '#c6f6d5', borderWidth: 1, borderColor: '#9ae6b4', padding: 12, borderRadius: 8, marginBottom: 12, alignItems: 'center' },
   acceptedBannerTitle: { fontSize: 16, fontWeight: 'bold', color: '#22543d', marginBottom: 4 },
   acceptedBannerSub: { fontSize: 14, color: '#2f855a', textAlign: 'center' },
-
-  parentContactBox: {
-    backgroundColor: '#f8fafc',
-    borderWidth: 1,
-    borderColor: '#e2e8f0',
-    padding: 14,
-    borderRadius: 8,
-    marginBottom: 12,
-  },
+  parentContactBox: { backgroundColor: '#f8fafc', borderWidth: 1, borderColor: '#e2e8f0', padding: 14, borderRadius: 8, marginBottom: 12 },
   contactBoxTitle: { fontSize: 15, fontWeight: 'bold', color: '#4a5568', marginBottom: 6 },
   contactText: { fontSize: 14, color: '#4a5568', marginBottom: 4 },
-  
   contactButton: { paddingVertical: 10, paddingHorizontal: 14, borderRadius: 8, alignItems: 'center', marginTop: 8, width: '100%' },
   chatAppButton: { backgroundColor: '#805ad5', paddingVertical: 10, paddingHorizontal: 14, borderRadius: 8, alignItems: 'center', marginTop: 8, width: '100%' },
   chatAppButtonText: { color: '#ffffff', fontWeight: 'bold', fontSize: 14 },
-  
   calendarButton: { backgroundColor: '#ecc94b', paddingVertical: 10, paddingHorizontal: 14, borderRadius: 8, alignItems: 'center', marginTop: 8 },
   calendarButtonText: { color: '#744210', fontWeight: 'bold', fontSize: 14 },
-  
-  whatsappButton: {
-    backgroundColor: '#25D366',
-    paddingVertical: 10,
-    paddingHorizontal: 14,
-    borderRadius: 8,
-    alignItems: 'center',
-    marginTop: 8,
-  },
+  whatsappButton: { backgroundColor: '#25D366', paddingVertical: 10, paddingHorizontal: 14, borderRadius: 8, alignItems: 'center', marginTop: 8 },
   contactButtonText: { color: '#ffffff', fontWeight: 'bold', fontSize: 14 },
-
-  completeButton: {
-    backgroundColor: '#3182ce',
-    paddingVertical: 10,
-    paddingHorizontal: 14,
-    borderRadius: 8,
-    alignItems: 'center',
-    marginTop: 8,
-  },
+  completeButton: { backgroundColor: '#3182ce', paddingVertical: 10, paddingHorizontal: 14, borderRadius: 8, alignItems: 'center', marginTop: 8 },
   completeButtonText: { color: '#ffffff', fontWeight: 'bold', fontSize: 14 },
-
   dateText: { fontSize: 13, color: '#718096', marginBottom: 16 },
   actionRow: { flexDirection: 'row', gap: 12, marginTop: 8 },
   actionButton: { flex: 1, paddingVertical: 10, borderRadius: 8, alignItems: 'center' },
   acceptButton: { backgroundColor: '#38a169' },
   rejectButton: { backgroundColor: '#e53e3e' },
   actionButtonText: { color: '#ffffff', fontWeight: 'bold', fontSize: 14 },
-  emptyText: {
-    fontSize: 16,
-    color: '#a0aec0',
-    fontStyle: 'italic',
-    marginBottom: 32,
-    textAlign: 'center',
-    marginTop: 20,
-  },
-
-  profileCard: {
-    width: '100%',
-    backgroundColor: '#fff',
-    borderRadius: 12,
-    padding: 20,
-    elevation: 2,
-    marginBottom: 32,
-  },
+  emptyText: { fontSize: 16, color: '#a0aec0', fontStyle: 'italic', marginBottom: 32, textAlign: 'center', marginTop: 20 },
+  profileCard: { width: '100%', backgroundColor: '#fff', borderRadius: 12, padding: 20, elevation: 2, marginBottom: 32 },
   profileCardTitle: { fontSize: 18, fontWeight: 'bold', color: '#2d3748', marginBottom: 4 },
   profileCardSubtitle: { fontSize: 14, color: '#718096', marginBottom: 16 },
   label: { fontSize: 14, fontWeight: '600', color: '#4a5568', marginBottom: 8 },
-  input: {
-    borderWidth: 1,
-    borderColor: '#e2e8f0',
-    borderRadius: 8,
-    padding: 12,
-    fontSize: 15,
-    backgroundColor: '#f8fafc',
-    marginBottom: 16,
-  },
+  input: { borderWidth: 1, borderColor: '#e2e8f0', borderRadius: 8, padding: 12, fontSize: 15, backgroundColor: '#f8fafc', marginBottom: 16 },
   textArea: { height: 100, textAlignVertical: 'top' },
-
-  currencyInputContainer: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: '#e2e8f0',
-    borderRadius: 8,
-    backgroundColor: '#f8fafc',
-    marginBottom: 16,
-    overflow: 'hidden',
-  },
-  currencyPrefix: {
-    paddingHorizontal: 12,
-    paddingVertical: 12,
-    backgroundColor: '#edf2f7',
-    color: '#4a5568',
-    fontWeight: 'bold',
-    fontSize: 15,
-    borderRightWidth: 1,
-    borderRightColor: '#e2e8f0',
-  },
-  currencyInput: {
-    flex: 1,
-    padding: 12,
-    fontSize: 15,
-  },
-
+  currencyInputContainer: { flexDirection: 'row', alignItems: 'center', borderWidth: 1, borderColor: '#e2e8f0', borderRadius: 8, backgroundColor: '#f8fafc', marginBottom: 16, overflow: 'hidden' },
+  currencyPrefix: { paddingHorizontal: 12, paddingVertical: 12, backgroundColor: '#edf2f7', color: '#4a5568', fontWeight: 'bold', fontSize: 15, borderRightWidth: 1, borderRightColor: '#e2e8f0' },
+  currencyInput: { flex: 1, padding: 12, fontSize: 15 },
   sectionDivider: { height: 1, backgroundColor: '#e2e8f0', marginVertical: 24 },
   sectionTitle: { fontSize: 16, fontWeight: 'bold', color: '#2d3748', marginBottom: 12 },
-
   chipContainer: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 16 },
-  chip: {
-    paddingVertical: 8,
-    paddingHorizontal: 16,
-    borderRadius: 20,
-    backgroundColor: '#edf2f7',
-    borderWidth: 1,
-    borderColor: '#cbd5e0',
-  },
+  chip: { paddingVertical: 8, paddingHorizontal: 16, borderRadius: 20, backgroundColor: '#edf2f7', borderWidth: 1, borderColor: '#cbd5e0' },
   chipSelected: { backgroundColor: '#ebf8ff', borderColor: '#3182ce' },
   chipText: { fontSize: 14, fontWeight: '600', color: '#4a5568' },
   chipTextSelected: { color: '#2b6cb0' },
-
-  saveButton: {
-    backgroundColor: '#3182ce',
-    paddingVertical: 14,
-    borderRadius: 8,
-    alignItems: 'center',
-    marginTop: 16,
-  },
-  saveButtonSuccess: {
-    backgroundColor: '#38a169',
-  },
+  saveButton: { backgroundColor: '#3182ce', paddingVertical: 14, borderRadius: 8, alignItems: 'center', marginTop: 16 },
+  saveButtonSuccess: { backgroundColor: '#38a169' },
   saveButtonText: { color: '#fff', fontSize: 16, fontWeight: 'bold' },
-
-  footerContainer: {
-    padding: 16,
-    backgroundColor: '#ffffff',
-    borderTopWidth: 1,
-    borderTopColor: '#e2e8f0',
-    alignItems: 'center',
-    width: '100%',
-  },
-  signOutButton: {
-    backgroundColor: '#e53e3e',
-    paddingVertical: 12,
-    paddingHorizontal: 24,
-    borderRadius: 8,
-    width: '100%',
-    maxWidth: 500,
-    alignItems: 'center',
-  },
-  signOutButtonText: {
-    color: '#ffffff',
-    fontSize: 16,
-    fontWeight: 'bold',
-  },
-
+  footerContainer: { padding: 16, backgroundColor: '#ffffff', borderTopWidth: 1, borderTopColor: '#e2e8f0', alignItems: 'center', width: '100%' },
+  signOutButton: { backgroundColor: '#e53e3e', paddingVertical: 12, paddingHorizontal: 24, borderRadius: 8, width: '100%', maxWidth: 500, alignItems: 'center' },
+  signOutButtonText: { color: '#ffffff', fontSize: 16, fontWeight: 'bold' },
   modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'center', alignItems: 'center', padding: 16 },
   modalName: { fontSize: 22, fontWeight: 'bold', color: '#2d3748', marginBottom: 4, textAlign: 'center' },
-  
   notificationsModal: { backgroundColor: '#ffffff', borderRadius: 16, padding: 24, width: '100%', maxWidth: 480, maxHeight: '80%' },
   notificationsHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16, borderBottomWidth: 1, borderBottomColor: '#edf2f7', paddingBottom: 12 },
   notificationCard: { padding: 12, backgroundColor: '#f7fafc', borderRadius: 8, marginBottom: 8, borderWidth: 1, borderColor: '#edf2f7' },
@@ -1259,7 +919,6 @@ const styles = StyleSheet.create({
   unreadDot: { width: 10, height: 10, borderRadius: 5, backgroundColor: '#3182ce' },
   notificationMessage: { fontSize: 14, color: '#4a5568', marginBottom: 6 },
   notificationDate: { fontSize: 12, color: '#a0aec0' },
-
   chatModalContent: { backgroundColor: '#ffffff', borderRadius: 16, width: '100%', maxWidth: 480, height: '80%', display: 'flex', flexDirection: 'column' },
   chatHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', padding: 16, borderBottomWidth: 1, borderBottomColor: '#edf2f7' },
   chatModalName: { fontSize: 18, fontWeight: 'bold', color: '#2d3748' },
