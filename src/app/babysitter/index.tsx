@@ -27,7 +27,6 @@ const showAlert = (title: string, message: string) => {
   }
 };
 
-// Convierte "Martes 27/10/2026" y "09:00 - 11:00" en formato Google Calendar "20261027T090000/20261027T110000"
 const buildGoogleCalendarDates = (jobDate?: string, jobTime?: string) => {
   if (!jobDate || !jobTime) return '';
   const dateMatch = jobDate.match(/(\d{2})\/(\d{2})\/(\d{4})/);
@@ -46,6 +45,13 @@ const buildGoogleCalendarDates = (jobDate?: string, jobTime?: string) => {
   return '&dates=' + ymd + 'T' + startH + startM + '00/' + ymd + 'T' + endH + endM + '00';
 };
 
+// --- NUEVO (Punto #3): Función para formatear a CLP (ej: "10000" -> "10.000") ---
+const formatCurrency = (value: string) => {
+  const cleanValue = value.replace(/\D/g, ''); // Quitar todo lo que no sea número
+  if (!cleanValue) return '';
+  return new Intl.NumberFormat('es-CL').format(Number(cleanValue));
+};
+
 export default function BabysitterHomeScreen() {
   const router = useRouter();
 
@@ -55,6 +61,9 @@ export default function BabysitterHomeScreen() {
   const [updatingId, setUpdatingId] = useState<string | null>(null);
   const [loadingProfile, setLoadingProfile] = useState(false);
   const [savingProfile, setSavingProfile] = useState(false);
+
+  // --- NUEVO (Punto #4): Estado para éxito del botón guardar ---
+  const [isSaved, setIsSaved] = useState(false);
 
   const [firstName, setFirstName] = useState('');
   const [lastName, setLastName] = useState('');
@@ -358,7 +367,12 @@ export default function BabysitterHomeScreen() {
       setFirstName(data.first_name || '');
       setLastName(data.last_name || '');
       setBio(data.bio || '');
-      setHourlyRate(data.hourly_rate ? data.hourly_rate.toString() : '');
+      
+      // --- MODIFICADO (Punto #3): Formatear tarifa con puntos al cargar ---
+      if (data.hourly_rate) {
+        setHourlyRate(formatCurrency(data.hourly_rate.toString()));
+      }
+
       setExperience(data.experience_years ? data.experience_years.toString() : '');
 
       if (data.location_zone) {
@@ -390,6 +404,14 @@ export default function BabysitterHomeScreen() {
       return;
     }
 
+    // --- NUEVO (Punto #2): Extraer solo los números y validar el mínimo de $10.000 ---
+    const numericRate = Number(hourlyRate.replace(/\D/g, ''));
+    
+    if (numericRate < 10000) {
+      showAlert('Tarifa muy baja', 'La tarifa mínima por hora debe ser de al menos $10.000 CLP.');
+      return;
+    }
+
     setSavingProfile(true);
     const { data: { session } } = await supabase.auth.getSession();
 
@@ -403,7 +425,7 @@ export default function BabysitterHomeScreen() {
       first_name: firstName,
       last_name: lastName,
       bio,
-      hourly_rate: Number(hourlyRate),
+      hourly_rate: numericRate, // <-- Enviamos el número limpio a DB
       experience_years: Number(experience),
       location_zone: selectedZones.join(', '),
       available_days: availableDays,
@@ -419,7 +441,9 @@ export default function BabysitterHomeScreen() {
       console.error('Error al guardar:', error.message);
       showAlert('Error', 'Hubo un problema al guardar tu perfil. Revisa la consola.');
     } else {
-      showAlert('Éxito', '¡Perfil y disponibilidad guardados correctamente!');
+      // --- MODIFICADO (Punto #4): Microinteracción visual sin pop-ups nativos ---
+      setIsSaved(true);
+      setTimeout(() => setIsSaved(false), 2000); // Vuelve al botón original en 2 segundos
     }
   };
 
@@ -669,8 +693,20 @@ export default function BabysitterHomeScreen() {
                   <TextInput style={styles.input} placeholder="Ej: Pérez" value={lastName} onChangeText={setLastName} />
                   <Text style={styles.label}>Sobre ti (Biografía corta)</Text>
                   <TextInput style={[styles.input, styles.textArea]} placeholder="Ej: Soy estudiante, muy responsable..." value={bio} onChangeText={setBio} multiline />
-                  <Text style={styles.label}>Tarifa por hora ($)</Text>
-                  <TextInput style={styles.input} placeholder="Ej: 5000" value={hourlyRate} onChangeText={setHourlyRate} keyboardType="numeric" />
+                  
+                  {/* --- MODIFICADO (Puntos #2 y #3): Input de tarifa con prefijo y formateo automático --- */}
+                  <Text style={styles.label}>Tarifa mínima por hora</Text>
+                  <View style={styles.currencyInputContainer}>
+                    <Text style={styles.currencyPrefix}>CLP</Text>
+                    <TextInput 
+                      style={styles.currencyInput} 
+                      placeholder="10.000" 
+                      value={hourlyRate} 
+                      onChangeText={(val) => setHourlyRate(formatCurrency(val))} // <-- Formateo on-the-fly
+                      keyboardType="numeric" 
+                    />
+                  </View>
+
                   <Text style={styles.label}>Años de experiencia</Text>
                   <TextInput style={styles.input} placeholder="Ej: 3" value={experience} onChangeText={setExperience} keyboardType="numeric" />
 
@@ -712,9 +748,21 @@ export default function BabysitterHomeScreen() {
                     })}
                   </View>
 
-                  <TouchableOpacity style={styles.saveButton} onPress={saveProfile} disabled={savingProfile}>
-                    {savingProfile ? <ActivityIndicator color="#fff" /> : <Text style={styles.saveButtonText}>Guardar Perfil y Disponibilidad</Text>}
+                  {/* --- MODIFICADO (Punto #4): Microinteracción visual al guardar --- */}
+                  <TouchableOpacity 
+                    style={[styles.saveButton, isSaved && styles.saveButtonSuccess]} 
+                    onPress={saveProfile} 
+                    disabled={savingProfile || isSaved}
+                  >
+                    {savingProfile ? (
+                      <ActivityIndicator color="#fff" />
+                    ) : isSaved ? (
+                      <Text style={styles.saveButtonText}>¡Guardado! ✅</Text>
+                    ) : (
+                      <Text style={styles.saveButtonText}>Guardar Perfil y Disponibilidad</Text>
+                    )}
                   </TouchableOpacity>
+
                 </>
               )}
             </View>
@@ -923,6 +971,7 @@ const styles = StyleSheet.create({
   contactBoxTitle: { fontSize: 15, fontWeight: 'bold', color: '#22543d', marginBottom: 6 },
   contactText: { fontSize: 14, color: '#2f855a', marginBottom: 4 },
   
+  contactButton: { paddingVertical: 10, paddingHorizontal: 14, borderRadius: 8, alignItems: 'center', marginTop: 8, width: '100%' },
   chatAppButton: { backgroundColor: '#805ad5', paddingVertical: 10, paddingHorizontal: 14, borderRadius: 8, alignItems: 'center', marginTop: 8, width: '100%' },
   chatAppButtonText: { color: '#ffffff', fontWeight: 'bold', fontSize: 14 },
   
@@ -937,7 +986,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginTop: 8,
   },
-  whatsappButtonText: { color: '#ffffff', fontWeight: 'bold', fontSize: 14 },
+  contactButtonText: { color: '#ffffff', fontWeight: 'bold', fontSize: 14 },
 
   completeButton: {
     backgroundColor: '#3182ce',
@@ -986,6 +1035,33 @@ const styles = StyleSheet.create({
   },
   textArea: { height: 100, textAlignVertical: 'top' },
 
+  // --- NUEVOS ESTILOS PARA EL INPUT DE MONEDA ---
+  currencyInputContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+    borderRadius: 8,
+    backgroundColor: '#f8fafc',
+    marginBottom: 16,
+    overflow: 'hidden',
+  },
+  currencyPrefix: {
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+    backgroundColor: '#edf2f7',
+    color: '#4a5568',
+    fontWeight: 'bold',
+    fontSize: 15,
+    borderRightWidth: 1,
+    borderRightColor: '#e2e8f0',
+  },
+  currencyInput: {
+    flex: 1,
+    padding: 12,
+    fontSize: 15,
+  },
+
   sectionDivider: { height: 1, backgroundColor: '#e2e8f0', marginVertical: 24 },
   sectionTitle: { fontSize: 16, fontWeight: 'bold', color: '#2d3748', marginBottom: 12 },
 
@@ -1003,11 +1079,14 @@ const styles = StyleSheet.create({
   chipTextSelected: { color: '#2b6cb0' },
 
   saveButton: {
-    backgroundColor: '#38a169',
+    backgroundColor: '#3182ce', // Botón original azul
     paddingVertical: 14,
     borderRadius: 8,
     alignItems: 'center',
     marginTop: 16,
+  },
+  saveButtonSuccess: {
+    backgroundColor: '#38a169', // Botón verde de éxito
   },
   saveButtonText: { color: '#fff', fontSize: 16, fontWeight: 'bold' },
 

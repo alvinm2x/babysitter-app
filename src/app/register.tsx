@@ -1,19 +1,40 @@
 import { supabase } from '@/utils/supabase';
 import { Link, useRouter } from 'expo-router';
 import { useState } from 'react';
-import { ActivityIndicator, Alert, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { ActivityIndicator, Alert, Platform, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 
 export default function RegisterScreen() {
   const router = useRouter();
   const [fullName, setFullName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState(''); // <-- NUEVO: Estado de confirmación
   const [role, setRole] = useState<'parent' | 'babysitter'>('parent');
   const [loading, setLoading] = useState(false);
 
+  // <-- NUEVO: Helper multiplataforma para alertas (evita errores en Vercel/Web)
+  const showAlert = (title: string, message: string) => {
+    if (Platform.OS === 'web') {
+      alert(`${title}: ${message}`);
+    } else {
+      Alert.alert(title, message);
+    }
+  };
+
   const handleRegister = async () => {
-    if (!email || !password || !fullName) {
-      Alert.alert('Campos requeridos', 'Por favor completa todos los campos.');
+    // <-- NUEVO: Validaciones de contraseña
+    if (!email || !password || !confirmPassword || !fullName) {
+      showAlert('Campos requeridos', 'Por favor completa todos los campos.');
+      return;
+    }
+
+    if (password.length < 6) {
+      showAlert('Contraseña corta', 'La contraseña debe tener al menos 6 caracteres.');
+      return;
+    }
+
+    if (password !== confirmPassword) {
+      showAlert('Error', 'Las contraseñas no coinciden. Por favor verifícalas.');
       return;
     }
 
@@ -22,7 +43,7 @@ export default function RegisterScreen() {
     try {
       // 1. Crear usuario en Supabase Auth
       const { data, error } = await supabase.auth.signUp({
-        email,
+        email: email.trim(),
         password,
         options: {
           data: { full_name: fullName, role: role },
@@ -44,7 +65,7 @@ export default function RegisterScreen() {
         if (profileError) throw profileError;
       }
 
-      Alert.alert('¡Cuenta creada!', `Registrado como ${role === 'babysitter' ? 'Babysitter' : 'Familia'}`);
+      showAlert('¡Cuenta creada!', `Registrado como ${role === 'babysitter' ? 'Babysitter' : 'Familia'}`);
       
       // Redirigir según el rol seleccionado
       if (role === 'babysitter') {
@@ -53,7 +74,7 @@ export default function RegisterScreen() {
         router.replace('/(parent)');
       }
     } catch (err: any) {
-      Alert.alert('Error al registrar', err.message || 'Ocurrió un error inesperado');
+      showAlert('Error al registrar', err.message || 'Ocurrió un error inesperado');
     } finally {
       setLoading(false);
     }
@@ -102,6 +123,15 @@ export default function RegisterScreen() {
         placeholder="Contraseña"
         value={password}
         onChangeText={setPassword}
+        secureTextEntry
+      />
+
+      {/* <-- NUEVO: Campo de confirmación */}
+      <TextInput
+        style={styles.input}
+        placeholder="Confirmar Contraseña"
+        value={confirmPassword}
+        onChangeText={setConfirmPassword}
         secureTextEntry
       />
 
