@@ -21,11 +21,20 @@ export default function LoginScreen() {
   const [showPassword, setShowPassword] = useState(false);
   const [isAdminTester, setIsAdminTester] = useState(false);
 
-  // NUEVO: Listener de Autenticación para Recuperación de Contraseña
+  // NUEVO: Listener Reforzado para Recuperación de Contraseña
   useEffect(() => {
+    // 1. Lectura directa de URL (Infalible para Vercel/Web)
+    if (Platform.OS === "web") {
+      const urlInfo = window.location.hash || window.location.search;
+      if (urlInfo.includes("type=recovery")) {
+        router.replace("/update-password");
+        return; // Detenemos aquí para que no siga cargando el login
+      }
+    }
+
+    // 2. Listener normal de Supabase (Para cuando la app ya está abierta)
     const { data: authListener } = supabase.auth.onAuthStateChange(
       async (event, session) => {
-        // Si Supabase detecta que la sesión inició a través de un enlace de recuperación
         if (event === "PASSWORD_RECOVERY") {
           router.replace("/update-password");
         }
@@ -148,7 +157,6 @@ export default function LoginScreen() {
               </TouchableOpacity>
             </View>
 
-            {/* BOTÓN DE RECUPERACIÓN DE CONTRASEÑA */}
             <TouchableOpacity
               onPress={() => router.push("/forgot-password")}
               style={styles.forgotPasswordButton}
@@ -223,11 +231,8 @@ const styles = StyleSheet.create({
   passwordInput: { flex: 1, padding: 12, fontSize: 16 },
   eyeButton: { padding: 12 },
   eyeIcon: { fontSize: 20 },
-
-  /* ESTILOS DEL NUEVO BOTÓN DE RECUPERAR CONTRASEÑA */
   forgotPasswordButton: { alignSelf: "flex-end", marginBottom: 8 },
   forgotPasswordText: { color: "#3182ce", fontSize: 14, fontWeight: "600" },
-
   button: {
     backgroundColor: "#3182ce",
     paddingVertical: 14,
