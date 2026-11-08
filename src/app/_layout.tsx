@@ -7,7 +7,7 @@ import {
   useSegments,
 } from "expo-router";
 import * as SplashScreen from "expo-splash-screen";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Platform,
@@ -26,9 +26,23 @@ export default function RootLayout() {
   const [session, setSession] = useState<any>(null);
   const [role, setRole] = useState<string | null>(null);
   const [isAdmin, setIsAdmin] = useState<boolean>(false);
-  const [isRecoveryMode, setIsRecoveryMode] = useState<boolean>(false);
+
+  // CANDADO SÍNCRONO: Inmune a retrasos de estado o limpiezas de URL de Supabase
+  const isRecoveryFlow = useRef<boolean>(false);
+
   const router = useRouter();
   const segments = useSegments();
+
+  // Detectar de inmediato (antes del primer render) si venimos del correo de recuperación
+  if (Platform.OS === "web" && typeof window !== "undefined") {
+    const fullUrl = window.location.href;
+    if (
+      fullUrl.includes("type=recovery") ||
+      window.location.pathname.includes("update-password")
+    ) {
+      isRecoveryFlow.current = true;
+    }
+  }
 
   const fetchUserRole = async (user: any) => {
     try {
@@ -53,20 +67,6 @@ export default function RootLayout() {
   };
 
   useEffect(() => {
-    // 1. Detectar en Web si entramos desde un link de recuperación antes que nada
-    if (Platform.OS === "web" && typeof window !== "undefined") {
-      const urlInfo =
-        window.location.hash ||
-        window.location.search ||
-        window.location.pathname;
-      if (
-        urlInfo.includes("type=recovery") ||
-        urlInfo.includes("update-password")
-      ) {
-        setIsRecoveryMode(true);
-      }
-    }
-
     supabase.auth.getSession().then(({ data: { session } }) => {
       setSession(session);
       if (session) {
@@ -79,27 +79,37 @@ export default function RootLayout() {
     const {
       data: { subscription },
     } = supabase.auth.onAuthStateChange(async (event, session) => {
+      console.log("🔔 AUTH EVENT:", event);
+
       if (event === "PASSWORD_RECOVERY") {
-        setIsRecoveryMode(true);
+        isRecoveryFlow.current = true;
         setSession(session);
         setIsLoading(false);
         router.replace("/update-password" as any);
         return;
       }
 
-      if (event === "USER_UPDATED") {
-        // Cuando termina de actualizar su contraseña, apagamos el modo recuperación
-        setIsRecoveryMode(false);
+      if (event === "SIGNED_OUT") {
+        isRecoveryFlow.current = false;
+        setSession(null);
+        setRole(null);
+        setIsAdmin(false);
+        setIsLoading(false);
+        return;
       }
 
       setSession(session);
       if (session) {
-        setIsLoading(true);
-        await fetchUserRole(session.user);
+        // CRÍTICO: NO activar setIsLoading(true) si estamos en recuperación,
+        // porque desmonta <Slot /> y destruye la pantalla update-password.
+        if (!isRecoveryFlow.current) {
+          await fetchUserRole(session.user);
+        } else {
+          setIsLoading(false);
+        }
       } else {
         setRole(null);
         setIsAdmin(false);
-        setIsRecoveryMode(false);
         setIsLoading(false);
       }
     });
@@ -107,7 +117,6 @@ export default function RootLayout() {
     return () => subscription.unsubscribe();
   }, []);
 
-  // Ocultar SplashScreen una vez finalizado el estado de carga
   useEffect(() => {
     if (!isLoading) {
       SplashScreen.hideAsync();
@@ -119,17 +128,25 @@ export default function RootLayout() {
     if (isLoading) return;
 
     const currentSegment = segments[0] as string | undefined;
+    const isWebOnUpdatePassword =
+      Platform.OS === "web" &&
+      typeof window !== "undefined" &&
+      window.location.pathname.includes("update-password");
 
-    // FRENO 1: Si estamos en flujo de recuperación de contraseña, forzar /update-password y NO redirigir por rol
-    if (isRecoveryMode || currentSegment === "update-password") {
+    // FRENO ABSOLUTO: Si el candado está activo o estamos en /update-password, NO MOVER AL USUARIO
+    if (
+      isRecoveryFlow.current ||
+      currentSegment === "update-password" ||
+      isWebOnUpdatePassword
+    ) {
       if (currentSegment !== "update-password") {
         router.replace("/update-password" as any);
       }
       return;
     }
 
-    // Permitir pantalla de forgot-password libremente
-    if (currentSegment === "forgot-password") {
+    // Permitir pantalla de forgot-password y register libremente
+    if (currentSegment === "forgot-password" || currentSegment === "register") {
       return;
     }
 
@@ -139,28 +156,24 @@ export default function RootLayout() {
       currentSegment === "admin";
 
     if (session) {
-      // Si es Super Admin (Tester), permitirle estar en el login ('/') para elegir vista o en '/admin'
       if (isAdmin) {
         return;
       }
 
-      // Si está autenticado pero no se ha determinado un rol válido, expulsar de rutas protegidas
       if (!role && inProtectedGroup) {
         router.replace("/");
         return;
       }
 
-      // Redirección forzada según el rol asignado para usuarios normales
       if (role === "parent" && currentSegment !== "parent") {
         router.replace("/parent");
       } else if (role === "babysitter" && currentSegment !== "babysitter") {
         router.replace("/babysitter");
       }
     } else if (!session && inProtectedGroup) {
-      // Si no hay sesión activa e intenta ingresar a una ruta protegida
       router.replace("/");
     }
-  }, [session, role, isAdmin, isRecoveryMode, isLoading, segments]);
+  }, [session, role, isAdmin, isLoading, segments]);
 
   return (
     <ThemeProvider value={colorScheme === "dark" ? DarkTheme : DefaultTheme}>
