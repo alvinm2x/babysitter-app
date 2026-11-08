@@ -1,6 +1,6 @@
 import { supabase } from "@/utils/supabase";
 import { useRouter } from "expo-router";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -18,6 +18,35 @@ export default function UpdatePasswordScreen() {
   const [confirmPassword, setConfirmPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
+
+  // Intercepta la sesión inmediatamente al cargar la pantalla
+  useEffect(() => {
+    const setupManualSession = async () => {
+      if (Platform.OS === "web" && typeof window !== "undefined") {
+        const url = window.location.href;
+
+        if (url.includes("access_token=")) {
+          // Extrae los parámetros de la URL independientemente de si usa # o ?
+          const paramsString = url.includes("#")
+            ? url.split("#")[1]
+            : url.split("?")[1];
+          const params = new URLSearchParams(paramsString);
+
+          const accessToken = params.get("access_token");
+          const refreshToken = params.get("refresh_token");
+
+          if (accessToken && refreshToken) {
+            await supabase.auth.setSession({
+              access_token: accessToken,
+              refresh_token: refreshToken,
+            });
+          }
+        }
+      }
+    };
+
+    setupManualSession();
+  }, []);
 
   const showAlert = (title: string, message: string) => {
     if (Platform.OS === "web") alert(`${title}: ${message}`);
@@ -41,10 +70,22 @@ export default function UpdatePasswordScreen() {
     }
 
     setLoading(true);
-    // Supabase detecta automáticamente la sesión activa por el token del link del correo
-    const { error } = await supabase.auth.updateUser({
-      password: password,
-    });
+
+    // Barrera de seguridad: Verificar que Supabase capturó la sesión
+    const {
+      data: { session },
+    } = await supabase.auth.getSession();
+
+    if (!session) {
+      setLoading(false);
+      showAlert(
+        "Enlace expirado",
+        "Por seguridad, este enlace ya caducó o fue utilizado. Por favor, vuelve al inicio y solicita un correo nuevo.",
+      );
+      return;
+    }
+
+    const { error } = await supabase.auth.updateUser({ password });
     setLoading(false);
 
     if (error) {
