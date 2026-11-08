@@ -1,6 +1,6 @@
 import { supabase } from "@/utils/supabase";
 import { useRouter } from "expo-router";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -20,6 +20,22 @@ export default function LoginScreen() {
 
   const [showPassword, setShowPassword] = useState(false);
   const [isAdminTester, setIsAdminTester] = useState(false);
+
+  // NUEVO: Listener de Autenticación para Recuperación de Contraseña
+  useEffect(() => {
+    const { data: authListener } = supabase.auth.onAuthStateChange(
+      async (event, session) => {
+        // Si Supabase detecta que la sesión inició a través de un enlace de recuperación
+        if (event === "PASSWORD_RECOVERY") {
+          router.replace("/update-password");
+        }
+      },
+    );
+
+    return () => {
+      authListener.subscription.unsubscribe();
+    };
+  }, []);
 
   const showAlert = (title: string, message: string) => {
     if (Platform.OS === "web") {
