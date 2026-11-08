@@ -1,6 +1,6 @@
 import { supabase } from "@/utils/supabase";
 import { useRouter } from "expo-router";
-import { useState, useEffect } from "react";
+import { useEffect, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -21,24 +21,23 @@ export default function LoginScreen() {
   const [showPassword, setShowPassword] = useState(false);
   const [isAdminTester, setIsAdminTester] = useState(false);
 
-  // Listener Reforzado para Recuperación de Contraseña (Sin errores de TypeScript)
   useEffect(() => {
-    // 1. Lectura directa de URL (Infalible para Vercel/Web)
+    // 1. Lectura directa de URL para Web/Vercel
     if (Platform.OS === "web" && typeof window !== "undefined") {
       const urlInfo = window.location.hash || window.location.search;
       if (urlInfo.includes("type=recovery")) {
-        router.replace("/update-password" as any);
-        return; // Detenemos aquí para que no siga cargando el login
+        router.replace("/update-password");
+        return;
       }
     }
 
-    // 2. Listener normal de Supabase (Para cuando la app ya está abierta)
+    // 2. Listener de Supabase
     const { data: authListener } = supabase.auth.onAuthStateChange(
       async (event) => {
         if (event === "PASSWORD_RECOVERY") {
-          router.replace("/update-password" as any);
+          router.replace("/update-password");
         }
-      }
+      },
     );
 
     return () => {
@@ -157,7 +156,6 @@ export default function LoginScreen() {
               </TouchableOpacity>
             </View>
 
-            {/* BOTÓN DE RECUPERACIÓN DE CONTRASEÑA */}
             <TouchableOpacity
               onPress={() => router.push("/forgot-password" as any)}
               style={styles.forgotPasswordButton}
@@ -182,4 +180,90 @@ export default function LoginScreen() {
 
           <View style={styles.registerContainer}>
             <Text style={styles.registerText}>¿No tienes una cuenta? </Text>
-            <TouchableOpacity onPress={() =>
+            <TouchableOpacity onPress={() => router.push("/register")}>
+              <Text style={styles.registerLink}>Regístrate</Text>
+            </TouchableOpacity>
+          </View>
+        </>
+      )}
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    justifyContent: "center",
+    padding: 24,
+    backgroundColor: "#fff",
+    maxWidth: 500,
+    alignSelf: "center",
+    width: "100%",
+  },
+  title: {
+    fontSize: 32,
+    fontWeight: "bold",
+    color: "#1a202c",
+    marginBottom: 8,
+  },
+  subtitle: { fontSize: 16, color: "#718096", marginBottom: 32 },
+  inputContainer: { marginBottom: 24 },
+  label: { fontSize: 14, fontWeight: "600", color: "#4a5568", marginBottom: 8 },
+  input: {
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+    borderRadius: 8,
+    padding: 12,
+    fontSize: 16,
+    marginBottom: 16,
+    backgroundColor: "#f7fafc",
+  },
+  passwordWrapper: {
+    flexDirection: "row",
+    alignItems: "center",
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+    borderRadius: 8,
+    backgroundColor: "#f7fafc",
+    marginBottom: 8,
+  },
+  passwordInput: { flex: 1, padding: 12, fontSize: 16 },
+  eyeButton: { padding: 12 },
+  eyeIcon: { fontSize: 20 },
+  forgotPasswordButton: { alignSelf: "flex-end", marginBottom: 8 },
+  forgotPasswordText: { color: "#3182ce", fontSize: 14, fontWeight: "600" },
+  button: {
+    backgroundColor: "#3182ce",
+    paddingVertical: 14,
+    borderRadius: 8,
+    alignItems: "center",
+  },
+  buttonText: { color: "#ffffff", fontSize: 16, fontWeight: "600" },
+  registerContainer: {
+    flexDirection: "row",
+    justifyContent: "center",
+    marginTop: 24,
+  },
+  registerText: { color: "#4a5568", fontSize: 15 },
+  registerLink: { color: "#3182ce", fontSize: 15, fontWeight: "bold" },
+  adminFastSwitchContainer: {
+    backgroundColor: "#f8fafc",
+    padding: 24,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+  },
+  adminFastSwitchTitle: {
+    fontSize: 18,
+    fontWeight: "bold",
+    color: "#2d3748",
+    marginBottom: 8,
+    textAlign: "center",
+  },
+  adminFastSwitchSub: {
+    fontSize: 14,
+    color: "#718096",
+    marginBottom: 24,
+    textAlign: "center",
+  },
+});
