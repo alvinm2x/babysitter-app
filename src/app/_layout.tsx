@@ -22,18 +22,19 @@ SplashScreen.preventAutoHideAsync();
 
 export default function RootLayout() {
   const colorScheme = useColorScheme();
-  const [isLoading, setIsLoading] = useState(true);
   const [session, setSession] = useState<any>(null);
-  const [role, setRole] = useState<string | null>(null);
-  const [isAdmin, setIsAdmin] = useState<boolean>(false);
 
-  // CANDADO SÍNCRONO: Inmune a retrasos de estado o limpiezas de URL de Supabase
+  // ESTADO ATÓMICO: Garantiza que el rol y el admin se evalúen exactamente al mismo tiempo
+  const [authData, setAuthData] = useState({
+    isLoaded: false,
+    role: null as string | null,
+    isAdmin: false,
+  });
+
   const isRecoveryFlow = useRef<boolean>(false);
-
   const router = useRouter();
   const segments = useSegments();
 
-  // Detectar de inmediato (antes del primer render) si venimos del correo de recuperación
   if (Platform.OS === "web" && typeof window !== "undefined") {
     const fullUrl = window.location.href;
     if (
@@ -55,36 +56,36 @@ export default function RootLayout() {
       const userRole = data?.role || user?.user_metadata?.role || null;
       const adminFlag = Boolean(data?.is_admin);
       console.log("🔍 ROL OBTENIDO:", userRole, "| ADMIN:", adminFlag);
-      setRole(userRole);
-      setIsAdmin(adminFlag);
+
+      // Actualización atómica en un solo golpe
+      setAuthData({ isLoaded: true, role: userRole, isAdmin: adminFlag });
     } catch (err) {
       console.error("Error al obtener el rol:", err);
-      setRole(user?.user_metadata?.role || null);
-      setIsAdmin(false);
-    } finally {
-      setIsLoading(false);
+      setAuthData({
+        isLoaded: true,
+        role: user?.user_metadata?.role || null,
+        isAdmin: false,
+      });
     }
   };
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      setSession(session);
-      if (session) {
-        fetchUserRole(session.user);
+    supabase.auth.getSession().then(({ data: { session: initialSession } }) => {
+      setSession(initialSession);
+      if (initialSession) {
+        fetchUserRole(initialSession.user);
       } else {
-        setIsLoading(false);
+        setAuthData((prev) => ({ ...prev, isLoaded: true }));
       }
     });
 
     const {
       data: { subscription },
-    } = supabase.auth.onAuthStateChange(async (event, session) => {
-      console.log("🔔 AUTH EVENT:", event);
-
+    } = supabase.auth.onAuthStateChange(async (event, currentSession) => {
       if (event === "PASSWORD_RECOVERY") {
         isRecoveryFlow.current = true;
-        setSession(session);
-        setIsLoading(false);
+        setSession(currentSession);
+        setAuthData((prev) => ({ ...prev, isLoaded: true }));
         router.replace("/update-password" as any);
         return;
       }
@@ -92,25 +93,19 @@ export default function RootLayout() {
       if (event === "SIGNED_OUT") {
         isRecoveryFlow.current = false;
         setSession(null);
-        setRole(null);
-        setIsAdmin(false);
-        setIsLoading(false);
+        setAuthData({ isLoaded: true, role: null, isAdmin: false });
         return;
       }
 
-      setSession(session);
-      if (session) {
-        // CRÍTICO: NO activar setIsLoading(true) si estamos en recuperación,
-        // porque desmonta <Slot /> y destruye la pantalla update-password.
+      setSession(currentSession);
+      if (currentSession) {
         if (!isRecoveryFlow.current) {
-          await fetchUserRole(session.user);
+          await fetchUserRole(currentSession.user);
         } else {
-          setIsLoading(false);
+          setAuthData((prev) => ({ ...prev, isLoaded: true }));
         }
       } else {
-        setRole(null);
-        setIsAdmin(false);
-        setIsLoading(false);
+        setAuthData({ isLoaded: true, role: null, isAdmin: false });
       }
     });
 
@@ -118,14 +113,14 @@ export default function RootLayout() {
   }, []);
 
   useEffect(() => {
-    if (!isLoading) {
+    if (authData.isLoaded) {
       SplashScreen.hideAsync();
     }
-  }, [isLoading]);
+  }, [authData.isLoaded]);
 
   // Protección de rutas y redirecciones automáticas por rol
   useEffect(() => {
-    if (isLoading) return;
+    if (!authData.isLoaded) return;
 
     const currentSegment = segments[0] as string | undefined;
     const isWebOnUpdatePassword =
@@ -133,7 +128,6 @@ export default function RootLayout() {
       typeof window !== "undefined" &&
       window.location.pathname.includes("update-password");
 
-    // FRENO ABSOLUTO: Si el candado está activo o estamos en /update-password, NO MOVER AL USUARIO
     if (
       isRecoveryFlow.current ||
       currentSegment === "update-password" ||
@@ -145,7 +139,6 @@ export default function RootLayout() {
       return;
     }
 
-    // Permitir pantalla de forgot-password y register libremente
     if (currentSegment === "forgot-password" || currentSegment === "register") {
       return;
     }
@@ -156,28 +149,32 @@ export default function RootLayout() {
       currentSegment === "admin";
 
     if (session) {
-      if (isAdmin) {
+      // Si es Admin, tiene pase libre a cualquier pantalla, nunca se redirige
+      if (authData.isAdmin) {
         return;
       }
 
-      if (!role && inProtectedGroup) {
+      if (!authData.role && inProtectedGroup) {
         router.replace("/");
         return;
       }
 
-      if (role === "parent" && currentSegment !== "parent") {
+      if (authData.role === "parent" && currentSegment !== "parent") {
         router.replace("/parent");
-      } else if (role === "babysitter" && currentSegment !== "babysitter") {
+      } else if (
+        authData.role === "babysitter" &&
+        currentSegment !== "babysitter"
+      ) {
         router.replace("/babysitter");
       }
     } else if (!session && inProtectedGroup) {
       router.replace("/");
     }
-  }, [session, role, isAdmin, isLoading, segments]);
+  }, [session, authData, segments]);
 
   return (
     <ThemeProvider value={colorScheme === "dark" ? DarkTheme : DefaultTheme}>
-      {isLoading ? (
+      {!authData.isLoaded ? (
         <View style={styles.loadingContainer}>
           <ActivityIndicator size="large" color="#3182CE" />
         </View>
