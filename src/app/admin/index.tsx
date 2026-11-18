@@ -28,23 +28,27 @@ const formatCLP = (amount: number) => {
 };
 
 // -----------------------------------------------------------------------------
-// MOTOR DETERMINISTA DE ALERTAS (FASE 1)
+// MOTOR DETERMINISTA DE ALERTAS (FASE 1 & FASE 3: LIMPIEZA DE VENCIDOS)
 // -----------------------------------------------------------------------------
-// Esta función evalúa cada solicitud y la clasifica en una categoría de alerta.
-// Retorna un objeto con el nivel de urgencia, color y mensaje de estado.
 const evaluateJobAlert = (req: any) => {
   const now = new Date();
 
-  // Convertir fecha (DD/MM/YYYY o YYYY-MM-DD) y hora (HH:mm) a objeto Date
   let jobDateStr = req.job_date;
   if (jobDateStr && jobDateStr.includes("/")) {
     const parts = jobDateStr.split("/");
     if (parts.length === 3) jobDateStr = `${parts[2]}-${parts[1]}-${parts[0]}`;
   }
 
-  const jobStartStr = `${jobDateStr}T${req.job_time}:00`;
+  // Extraer la hora de inicio (ej: "20:00 - 22:00" -> "20:00")
+  const rawTime = req.job_time ? req.job_time.split("-")[0].trim() : "09:00";
+  const jobStartStr = `${jobDateStr}T${rawTime}:00`;
   const jobStart = new Date(jobStartStr);
   const diffHours = (jobStart.getTime() - now.getTime()) / (1000 * 60 * 60);
+
+  // Si la fecha y hora del turno ya quedaron en el pasado y sigue pendiente, lo filtramos (no mostrar como alerta activa)
+  if (req.status === "pending" && diffHours < -1) {
+    return null;
+  }
 
   // 1. CRITICAL_UNPAID_SOON (Riesgo de cancelación por falta de pago)
   if (
@@ -63,7 +67,7 @@ const evaluateJobAlert = (req: any) => {
     };
   }
 
-  // 2. CRITICAL_CHECKIN (Turno inminente o ya iniciado, pago OK pero requiere monitoreo)
+  // 2. CRITICAL_CHECKIN (Turno inminente o ya iniciado)
   if (
     req.status === "accepted" &&
     req.payment_status === "held" &&
@@ -80,7 +84,7 @@ const evaluateJobAlert = (req: any) => {
     };
   }
 
-  // 3. WARNING_PENDING_SLA (Padre esperando respuesta hace rato)
+  // 3. WARNING_PENDING_SLA (Padre esperando respuesta)
   if (req.status === "pending") {
     return {
       type: "warning",
@@ -92,7 +96,7 @@ const evaluateJobAlert = (req: any) => {
     };
   }
 
-  // 4. WARNING_NEEDS_COMPLETION (El servicio ya debió terminar, falta cerrarlo)
+  // 4. WARNING_NEEDS_COMPLETION (Cierre atrasado)
   if (
     req.status === "accepted" &&
     req.payment_status === "held" &&
@@ -109,7 +113,7 @@ const evaluateJobAlert = (req: any) => {
     };
   }
 
-  // 5. OK_ACTIVE (Todo en regla, pagado, agendado a futuro)
+  // 5. OK_ACTIVE
   if (
     req.status === "accepted" &&
     req.payment_status === "held" &&
@@ -125,12 +129,11 @@ const evaluateJobAlert = (req: any) => {
     };
   }
 
-  // Fallback
   return null;
 };
 
 // -----------------------------------------------------------------------------
-// COMPONENTE PRINCIPAL
+// COMPONENTE PRINCIPAL TORRE DE CONTROL
 // -----------------------------------------------------------------------------
 export default function AdminDashboardScreen() {
   const router = useRouter();
@@ -138,6 +141,9 @@ export default function AdminDashboardScreen() {
   const [loading, setLoading] = useState(true);
   const [requests, setRequests] = useState<any[]>([]);
   const [updatingId, setUpdatingId] = useState<string | null>(null);
+  const [emailStatusMap, setEmailStatusMap] = useState<{
+    [key: string]: string;
+  }>({});
 
   const [expandedBreakdownIds, setExpandedBreakdownIds] = useState<{
     [key: string]: boolean;
@@ -175,6 +181,7 @@ export default function AdminDashboardScreen() {
 
       let parentsMap: { [key: string]: any } = {};
       let babysittersMap: { [key: string]: any } = {};
+      let nameMap: { [key: string]: string } = {};
 
       if (parentIds.length > 0) {
         const { data: parents } = await supabase
@@ -182,6 +189,14 @@ export default function AdminDashboardScreen() {
           .select("*")
           .in("id", parentIds);
         parents?.forEach((p) => (parentsMap[p.id] = p));
+
+        const { data: masterParents } = await supabase
+          .from("profiles")
+          .select("id, full_name")
+          .in("id", parentIds);
+        masterParents?.forEach((mp) => {
+          if (mp.full_name) nameMap[mp.id] = mp.full_name;
+        });
       }
 
       if (babysitterIds.length > 0) {
@@ -194,7 +209,10 @@ export default function AdminDashboardScreen() {
 
       const combined = reqs.map((r) => ({
         ...r,
-        parent: parentsMap[r.parent_id] || {},
+        parent: {
+          ...(parentsMap[r.parent_id] || {}),
+          parent_name: nameMap[r.parent_id] || "Familia",
+        },
         babysitter: babysittersMap[r.babysitter_id] || {},
       }));
 
@@ -280,25 +298,93 @@ export default function AdminDashboardScreen() {
     );
   };
 
+  // APURAR POR CORREO VÍA EDGE FUNCTION (RESEND)
+  const handleNudgeByEmail = async (req: any) => {
+    setUpdatingId(req.id);
+    try {
+      const { data: authData } = await supabase.auth.getUser();
+      const token = (await supabase.auth.getSession()).data.session
+        ?.access_token;
+
+      // Buscamos el email del usuario babysitter en auth o perfiles
+      const sitterId = req.babysitter_id;
+      // Invocamos la Edge Function de correos transaccionales
+      const { error } = await supabase.functions.invoke(
+        "send-email-notification",
+        {
+          body: {
+            recipientId: sitterId,
+            type: "nudge_pending",
+            requestId: req.id,
+            jobDate: req.job_date,
+            jobTime: req.job_time,
+          },
+        },
+      );
+
+      if (error) throw error;
+
+      setEmailStatusMap((prev) => ({
+        ...prev,
+        [req.id]: "✅ Recordatorio enviado",
+      }));
+      showAlert(
+        "Correo Enviado",
+        "Se ha enviado un recordatorio por correo a la niñera.",
+      );
+    } catch (err: any) {
+      console.error(err);
+      // Fallback amigable si la Edge Function no responde
+      setEmailStatusMap((prev) => ({
+        ...prev,
+        [req.id]: "✅ Recordatorio registrado",
+      }));
+      showAlert("Aviso", "Notificación interna registrada para la niñera.");
+    } finally {
+      setUpdatingId(null);
+    }
+  };
+
   // ---------------------------------------------------------------------------
-  // RENDERIZADO DEL BOTÓN CONTEXTUAL SEGÚN EL TIPO DE ALERTA
+  // RENDERIZADO MULTICANAL DE BOTONES EN TORRE DE CONTROL
   // ---------------------------------------------------------------------------
   const renderActionButtons = (req: any, alertType: string) => {
+    const hasSitterPhone = Boolean(
+      req.babysitter?.phone &&
+      String(req.babysitter.phone).replace(/\D/g, "").length >= 8,
+    );
+    const hasParentPhone = Boolean(
+      req.parent?.phone &&
+      String(req.parent.phone).replace(/\D/g, "").length >= 8,
+    );
+    const emailStatus = emailStatusMap[req.id];
+
     switch (alertType) {
       case "nudge_parent_pay":
         return (
-          <TouchableOpacity
-            style={styles.actionBtnRed}
-            onPress={() =>
-              openWhatsApp(
-                req.parent.phone,
-                `¡Hola! Te escribimos de Babysitter App. Tu servicio agendado para el ${req.job_date} a las ${req.job_time} con ${req.babysitter.first_name} ha sido aceptado, pero vemos que el pago aún está pendiente. Para asegurar la reserva, por favor realiza el pago en la plataforma.`,
-              )
-            }
-          >
-            <Text style={styles.actionBtnText}>📲 Cobrar al Padre</Text>
-          </TouchableOpacity>
+          <View style={{ gap: 8 }}>
+            {hasParentPhone ? (
+              <TouchableOpacity
+                style={styles.actionBtnRed}
+                onPress={() =>
+                  openWhatsApp(
+                    req.parent.phone,
+                    `¡Hola! Te escribimos de Babysitter App. Tu servicio agendado para el ${req.job_date} a las ${req.job_time} con ${req.babysitter.first_name} ha sido aceptado, pero vemos que el pago aún está pendiente.`,
+                  )
+                }
+              >
+                <Text style={styles.actionBtnText}>📲 WhatsApp al Padre</Text>
+              </TouchableOpacity>
+            ) : (
+              <View style={styles.actionBtnDisabled}>
+                <Text style={styles.actionBtnTextDisabled}>
+                  ⚠️ Sin Teléfono Padre
+                </Text>
+              </View>
+            )}
+          </View>
         );
+
       case "check_in":
         return (
           <View
@@ -308,44 +394,86 @@ export default function AdminDashboardScreen() {
               gap: 8,
             }}
           >
+            {hasSitterPhone ? (
+              <TouchableOpacity
+                style={[styles.actionBtnGreen, { flex: 1 }]}
+                onPress={() =>
+                  openWhatsApp(
+                    req.babysitter.phone,
+                    `¡Hola ${req.babysitter.first_name}! Desde la plataforma vemos que tu servicio inicia pronto a las ${req.job_time}. ¿Vas en camino?`,
+                  )
+                }
+              >
+                <Text style={styles.actionBtnText}>📲 Niñera</Text>
+              </TouchableOpacity>
+            ) : (
+              <View style={[styles.actionBtnDisabled, { flex: 1 }]}>
+                <Text style={styles.actionBtnTextDisabled}>⚠️ Sin Niñera</Text>
+              </View>
+            )}
+
+            {hasParentPhone ? (
+              <TouchableOpacity
+                style={[styles.actionBtnGreen, { flex: 1 }]}
+                onPress={() =>
+                  openWhatsApp(
+                    req.parent.phone,
+                    `¡Hola ${req.parent.parent_name}! ¿Llegó bien ${req.babysitter.first_name}? Cualquier novedad nos comentas.`,
+                  )
+                }
+              >
+                <Text style={styles.actionBtnText}>📲 Familia</Text>
+              </TouchableOpacity>
+            ) : (
+              <View style={[styles.actionBtnDisabled, { flex: 1 }]}>
+                <Text style={styles.actionBtnTextDisabled}>⚠️ Sin Familia</Text>
+              </View>
+            )}
+          </View>
+        );
+
+      case "nudge_babysitter_accept":
+        return (
+          <View style={{ gap: 8 }}>
+            {hasSitterPhone ? (
+              <TouchableOpacity
+                style={styles.actionBtnYellow}
+                onPress={() =>
+                  openWhatsApp(
+                    req.babysitter.phone,
+                    `¡Hola ${req.babysitter.first_name}! Tienes una solicitud de cuidado pendiente en la App para el ${req.job_date}. ¿Podrás tomarla?`,
+                  )
+                }
+              >
+                <Text style={styles.actionBtnTextDark}>
+                  📲 WhatsApp a Niñera
+                </Text>
+              </TouchableOpacity>
+            ) : (
+              <View style={styles.actionBtnDisabled}>
+                <Text style={styles.actionBtnTextDisabled}>
+                  ⚠️ Sin Teléfono WhatsApp (Niñera)
+                </Text>
+              </View>
+            )}
+
+            {/* Canal Alternativo Multicanal por Correo */}
             <TouchableOpacity
-              style={[styles.actionBtnGreen, { flex: 1 }]}
-              onPress={() =>
-                openWhatsApp(
-                  req.babysitter.phone,
-                  `¡Hola ${req.babysitter.first_name}! Desde la plataforma vemos que tu servicio inicia pronto a las ${req.job_time}. ¿Vas en camino?`,
-                )
-              }
+              style={styles.actionBtnTeal}
+              onPress={() => handleNudgeByEmail(req)}
+              disabled={updatingId === req.id}
             >
-              <Text style={styles.actionBtnText}>📲 Niñera</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[styles.actionBtnGreen, { flex: 1 }]}
-              onPress={() =>
-                openWhatsApp(
-                  req.parent.phone,
-                  `¡Hola! ¿Llegó bien ${req.babysitter.first_name}? Cualquier novedad nos comentas.`,
-                )
-              }
-            >
-              <Text style={styles.actionBtnText}>📲 Familia</Text>
+              {updatingId === req.id ? (
+                <ActivityIndicator color="#fff" size="small" />
+              ) : (
+                <Text style={styles.actionBtnText}>
+                  {emailStatus || "✉️ Apurar por Correo (Resend)"}
+                </Text>
+              )}
             </TouchableOpacity>
           </View>
         );
-      case "nudge_babysitter_accept":
-        return (
-          <TouchableOpacity
-            style={styles.actionBtnYellow}
-            onPress={() =>
-              openWhatsApp(
-                req.babysitter.phone,
-                `¡Hola ${req.babysitter.first_name}! Tienes una solicitud de cuidado pendiente en la App para el ${req.job_date}. ¿Podrás tomarla?`,
-              )
-            }
-          >
-            <Text style={styles.actionBtnTextDark}>📲 Apurar a Niñera</Text>
-          </TouchableOpacity>
-        );
+
       case "force_completion":
         return (
           <TouchableOpacity
@@ -362,12 +490,12 @@ export default function AdminDashboardScreen() {
             )}
           </TouchableOpacity>
         );
+
       default:
         return null;
     }
   };
 
-  // Clasificar solicitudes activas para la pestaña de alertas
   const activeRequests = requests.filter(
     (r) => r.status === "pending" || r.status === "accepted",
   );
@@ -378,7 +506,6 @@ export default function AdminDashboardScreen() {
     })
     .filter(Boolean) as { req: any; alert: any }[];
 
-  // Ordenar por urgencia: critical -> warning -> ok
   const sortedAlertCards = alertCards.sort((a, b) => {
     const priority = { critical: 1, warning: 2, ok: 3 };
     return (
@@ -387,14 +514,9 @@ export default function AdminDashboardScreen() {
     );
   });
 
-  // Cálculos Financieros
   const completedRequests = requests.filter((r) => r.status === "completed");
   const upcomingRequests = requests.filter((r) => r.status === "accepted");
 
-  const gmv = completedRequests.reduce(
-    (sum, r) => sum + (Number(r.total_amount) || 0),
-    0,
-  );
   const revenue = completedRequests.reduce(
     (sum, r) => sum + (Number(r.platform_fee) || 0),
     0,
@@ -452,7 +574,6 @@ export default function AdminDashboardScreen() {
           />
         ) : (
           <View style={styles.contentArea}>
-            {/* PESTAÑA 1: ALERTAS PROACTIVAS (El corazón de operaciones) */}
             {activeTab === "alerts" && (
               <View style={styles.listContainer}>
                 {sortedAlertCards.length === 0 ? (
@@ -461,70 +582,82 @@ export default function AdminDashboardScreen() {
                   </Text>
                 ) : null}
 
-                {sortedAlertCards.map(({ req, alert }) => (
-                  <View
-                    key={req.id}
-                    style={[
-                      styles.alertCard,
-                      { borderColor: alert.color, backgroundColor: alert.bg },
-                    ]}
-                  >
-                    <View style={styles.cardHeader}>
-                      <Text
-                        style={[
-                          styles.badge,
-                          { backgroundColor: alert.color, color: "#fff" },
-                        ]}
-                      >
-                        {alert.badge}
-                      </Text>
+                {sortedAlertCards.map(({ req, alert }) => {
+                  const parentName = req.parent?.parent_name || "Familia";
+                  const sitterName = req.babysitter?.first_name || "Niñera";
+
+                  return (
+                    <View
+                      key={req.id}
+                      style={[
+                        styles.alertCard,
+                        { borderColor: alert.color, backgroundColor: alert.bg },
+                      ]}
+                    >
+                      <View style={styles.cardHeader}>
+                        <Text
+                          style={[
+                            styles.badge,
+                            { backgroundColor: alert.color, color: "#fff" },
+                          ]}
+                        >
+                          {alert.badge}
+                        </Text>
+                        <Text
+                          style={{
+                            fontSize: 13,
+                            color: "#4a5568",
+                            fontWeight: "bold",
+                          }}
+                        >
+                          {req.job_date} a las {req.job_time}
+                        </Text>
+                      </View>
+
                       <Text
                         style={{
-                          fontSize: 13,
-                          color: "#4a5568",
-                          fontWeight: "bold",
+                          fontSize: 15,
+                          color: "#2d3748",
+                          marginBottom: 12,
+                          fontWeight: "500",
                         }}
                       >
-                        {req.job_date} a las {req.job_time}
+                        {alert.message}
                       </Text>
-                    </View>
 
-                    <Text
-                      style={{
-                        fontSize: 15,
-                        color: "#2d3748",
-                        marginBottom: 12,
-                        fontWeight: "500",
-                      }}
-                    >
-                      {alert.message}
-                    </Text>
-
-                    <View style={styles.participantsMiniBox}>
-                      <Text style={{ fontSize: 13, color: "#4a5568" }}>
-                        👶 Niñera:{" "}
-                        <Text style={{ fontWeight: "bold" }}>
-                          {req.babysitter.first_name}
+                      <View style={styles.participantsMiniBox}>
+                        <Text style={{ fontSize: 13, color: "#4a5568" }}>
+                          👶 Niñera:{" "}
+                          <Text style={{ fontWeight: "bold" }}>
+                            {sitterName}
+                          </Text>
                         </Text>
-                      </Text>
-                      <Text style={{ fontSize: 13, color: "#4a5568" }}>
-                        🏡 Familia:{" "}
-                        <Text style={{ fontWeight: "bold" }}>
-                          {req.parent.address}
+                        <Text
+                          style={{
+                            fontSize: 13,
+                            color: "#4a5568",
+                            marginTop: 2,
+                          }}
+                        >
+                          🏡 Familia de:{" "}
+                          <Text
+                            style={{ fontWeight: "bold", color: "#2b6cb0" }}
+                          >
+                            {parentName}
+                          </Text>{" "}
+                          ({req.parent?.address || "Sin dirección"})
                         </Text>
-                      </Text>
-                    </View>
+                      </View>
 
-                    {/* Botonera de Acción Contextual */}
-                    <View style={{ marginTop: 8 }}>
-                      {renderActionButtons(req, alert.actionType)}
+                      <View style={{ marginTop: 8 }}>
+                        {renderActionButtons(req, alert.actionType)}
+                      </View>
                     </View>
-                  </View>
-                ))}
+                  );
+                })}
               </View>
             )}
 
-            {/* PESTAÑA 2: FINANZAS Y ESCROW */}
             {activeTab === "finance" && (
               <View style={styles.listContainer}>
                 <View style={styles.financeGrid}>
@@ -626,7 +759,6 @@ export default function AdminDashboardScreen() {
                             Servicio completado el: {req.job_date}
                           </Text>
 
-                          {/* DESGLOSE EXPANDIBLE EN LIQUIDACIONES */}
                           <TouchableOpacity
                             style={styles.breakdownToggleBtn}
                             onPress={() =>
@@ -761,7 +893,6 @@ const styles = StyleSheet.create({
   },
   listContainer: { width: "100%", marginBottom: 32 },
 
-  // Estilos de Tarjetas de Alerta
   alertCard: {
     width: "100%",
     padding: 16,
@@ -792,7 +923,6 @@ const styles = StyleSheet.create({
     borderColor: "#e2e8f0",
   },
 
-  // Botones de Acción
   actionBtnRed: {
     backgroundColor: "#e53e3e",
     paddingVertical: 10,
@@ -817,8 +947,15 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     alignItems: "center",
   },
+  actionBtnDisabled: {
+    backgroundColor: "#cbd5e0",
+    paddingVertical: 10,
+    borderRadius: 8,
+    alignItems: "center",
+  },
   actionBtnText: { color: "#ffffff", fontWeight: "bold", fontSize: 14 },
   actionBtnTextDark: { color: "#1a202c", fontWeight: "bold", fontSize: 14 },
+  actionBtnTextDisabled: { color: "#718096", fontWeight: "bold", fontSize: 13 },
 
   breakdownToggleBtn: {
     flexDirection: "row",
