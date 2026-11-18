@@ -295,7 +295,6 @@ export default function BabysitterHomeScreen() {
       } = await supabase.auth.getUser();
       if (!user) return;
 
-      // 1. OPTIMISTIC UI: Mostrar el mensaje en pantalla en 0 ms
       const tempId = "temp_" + Date.now();
       const optimisticMsg = {
         id: tempId,
@@ -309,7 +308,6 @@ export default function BabysitterHomeScreen() {
       setMessages((prev) => [...prev, optimisticMsg]);
       setNewMessage("");
 
-      // 2. Insertar en Supabase y recuperar la fila real
       const { data: insertedRows, error } = await supabase
         .from("messages")
         .insert([
@@ -438,22 +436,38 @@ export default function BabysitterHomeScreen() {
         new Set(reqs.map((r) => r.parent_id).filter(Boolean)),
       );
       let profilesMap: { [key: string]: any } = {};
+      let nameMap: { [key: string]: string } = {};
 
       if (parentIds.length > 0) {
         const { data: profiles, error: profError } = await supabase
           .from("parent_profiles")
           .select("id, phone, address, children_info, emergency_contact")
           .in("id", parentIds);
+
         if (!profError && profiles) {
           profiles.forEach((p) => {
             profilesMap[p.id] = p;
+          });
+        }
+
+        const { data: masterProfiles, error: masterErr } = await supabase
+          .from("profiles")
+          .select("id, full_name")
+          .in("id", parentIds);
+
+        if (!masterErr && masterProfiles) {
+          masterProfiles.forEach((mp) => {
+            if (mp.full_name) nameMap[mp.id] = mp.full_name;
           });
         }
       }
 
       const combined = reqs.map((r) => ({
         ...r,
-        parent_profiles: profilesMap[r.parent_id] || {},
+        parent_profiles: {
+          ...(profilesMap[r.parent_id] || {}),
+          parent_name: nameMap[r.parent_id] || "Familia",
+        },
       }));
       setRequests(combined);
     } catch (error: any) {
@@ -607,7 +621,6 @@ export default function BabysitterHomeScreen() {
     setLoadingProfile(false);
   };
 
-  // GUARDADO RÁPIDO DE TELÉFONO EN 1 CLIC DESDE EL BANNER SUPERIOR
   const handleQuickSavePhone = async () => {
     const cleanDigits = quickPhoneInput.replace(/\D/g, "");
     if (cleanDigits.length < 8) {
@@ -811,7 +824,6 @@ export default function BabysitterHomeScreen() {
           </TouchableOpacity>
         </View>
 
-        {/* BANNER DE ACTIVACIÓN RÁPIDA DE TELÉFONO (ÍTEM #22 FASE 3) */}
         {!loadingProfile && !hasValidPhone && (
           <View style={styles.phoneGateBanner}>
             <Text style={styles.phoneGateTitle}>
@@ -911,6 +923,7 @@ export default function BabysitterHomeScreen() {
                     .toLowerCase()
                     .trim();
                   const parentInfo = req.parent_profiles || {};
+                  const parentDisplayName = parentInfo.parent_name || "Familia";
                   const isAccepted = statusNormalized === "accepted";
 
                   const reqHours = getHoursFromTimeRange(req.job_time);
@@ -928,9 +941,19 @@ export default function BabysitterHomeScreen() {
                   return (
                     <View key={req.id} style={styles.card}>
                       <View style={styles.cardHeader}>
-                        <Text style={styles.requestId}>
-                          Nueva Solicitud de Trabajo
-                        </Text>
+                        <View style={{ flex: 1 }}>
+                          <Text style={styles.requestId}>
+                            Solicitud de Trabajo
+                          </Text>
+                          <Text style={styles.parentNameSubtitle}>
+                            👨‍👩‍👧 Familia de:{" "}
+                            <Text
+                              style={{ fontWeight: "bold", color: "#2b6cb0" }}
+                            >
+                              {parentDisplayName}
+                            </Text>
+                          </Text>
+                        </View>
                         <Text
                           style={[
                             styles.badge,
@@ -1056,7 +1079,7 @@ export default function BabysitterHomeScreen() {
                       {isAccepted && (
                         <View style={styles.parentContactBox}>
                           <Text style={styles.contactBoxTitle}>
-                            📍 Datos de la Familia
+                            📍 Datos de la Familia ({parentDisplayName})
                           </Text>
                           <Text style={styles.contactText}>
                             🏠 Dirección:{" "}
@@ -1080,6 +1103,7 @@ export default function BabysitterHomeScreen() {
                             onPress={() => {
                               setActiveChatParent({
                                 id: req.parent_id,
+                                parent_name: parentDisplayName,
                                 ...parentInfo,
                               });
                               setActiveRequestId(req.id);
@@ -1087,7 +1111,7 @@ export default function BabysitterHomeScreen() {
                             }}
                           >
                             <Text style={styles.chatAppButtonText}>
-                              💬 Chat en la App
+                              💬 Chat con {parentDisplayName}
                             </Text>
                           </TouchableOpacity>
 
@@ -1095,7 +1119,7 @@ export default function BabysitterHomeScreen() {
                             style={styles.calendarButton}
                             onPress={() =>
                               handleAddToCalendar(
-                                "Trabajo de Niñera",
+                                "Trabajo con Familia " + parentDisplayName,
                                 req.job_date,
                                 req.job_time,
                                 parentInfo.address,
@@ -1118,7 +1142,7 @@ export default function BabysitterHomeScreen() {
                               }
                             >
                               <Text style={styles.contactButtonText}>
-                                📱 WhatsApp
+                                📱 WhatsApp con {parentDisplayName}
                               </Text>
                             </TouchableOpacity>
                           )}
@@ -1242,6 +1266,7 @@ export default function BabysitterHomeScreen() {
                     .toLowerCase()
                     .trim();
                   const parentInfo = req.parent_profiles || {};
+                  const parentDisplayName = parentInfo.parent_name || "Familia";
                   const isCompleted = statusNormalized === "completed";
                   const isRejected = statusNormalized === "rejected";
 
@@ -1262,9 +1287,17 @@ export default function BabysitterHomeScreen() {
                   return (
                     <View key={req.id} style={styles.card}>
                       <View style={styles.cardHeader}>
-                        <Text style={styles.requestId}>
-                          Servicio registrado
-                        </Text>
+                        <View style={{ flex: 1 }}>
+                          <Text style={styles.requestId}>
+                            Servicio registrado
+                          </Text>
+                          <Text style={styles.parentNameSubtitle}>
+                            👨‍👩‍👧 Familia de:{" "}
+                            <Text style={{ fontWeight: "bold" }}>
+                              {parentDisplayName}
+                            </Text>
+                          </Text>
+                        </View>
                         <Text
                           style={[
                             styles.badge,
@@ -1374,7 +1407,7 @@ export default function BabysitterHomeScreen() {
                       {isCompleted && (
                         <View style={styles.parentContactBox}>
                           <Text style={styles.contactBoxTitle}>
-                            📍 Familia atendida
+                            📍 Familia atendida ({parentDisplayName})
                           </Text>
                           <Text style={styles.contactText}>
                             🏠 Dirección:{" "}
@@ -1588,6 +1621,7 @@ export default function BabysitterHomeScreen() {
         </TouchableOpacity>
       </View>
 
+      {/* NOTIFICACIONES ACCIONABLES (DEEP LINKING A SOLICITUD) */}
       {showNotifications && (
         <Modal
           visible={showNotifications}
@@ -1629,7 +1663,11 @@ export default function BabysitterHomeScreen() {
                         styles.notificationCard,
                         !notif.is_read && styles.notificationUnread,
                       ]}
-                      onPress={() => markNotificationAsRead(notif.id)}
+                      onPress={async () => {
+                        await markNotificationAsRead(notif.id);
+                        setShowNotifications(false);
+                        setActiveTab("requests");
+                      }}
                     >
                       <View style={styles.notificationHeaderRow}>
                         <Text style={styles.notificationTitle}>
@@ -1641,7 +1679,8 @@ export default function BabysitterHomeScreen() {
                         {notif.message}
                       </Text>
                       <Text style={styles.notificationDate}>
-                        {new Date(notif.created_at).toLocaleString()}
+                        {new Date(notif.created_at).toLocaleString()} (Toca para
+                        ver)
                       </Text>
                     </TouchableOpacity>
                   ))
@@ -1652,6 +1691,7 @@ export default function BabysitterHomeScreen() {
         </Modal>
       )}
 
+      {/* CHAT CON IDENTIDAD VISIBLE DE LA FAMILIA */}
       {isChatOpen && (
         <Modal
           visible={isChatOpen}
@@ -1663,7 +1703,9 @@ export default function BabysitterHomeScreen() {
             <View style={styles.chatModalContent}>
               <View style={styles.chatHeader}>
                 <View>
-                  <Text style={styles.chatModalName}>Chat con la Familia</Text>
+                  <Text style={styles.chatModalName}>
+                    Chat con {activeChatParent?.parent_name || "la Familia"}
+                  </Text>
                   <Text style={{ fontSize: 12, color: "#38a169" }}>
                     ● Conectado en tiempo real
                   </Text>
@@ -1888,10 +1930,11 @@ const styles = StyleSheet.create({
   cardHeader: {
     flexDirection: "row",
     justifyContent: "space-between",
-    alignItems: "center",
+    alignItems: "flex-start",
     marginBottom: 12,
   },
   requestId: { fontSize: 16, fontWeight: "bold", color: "#2d3748" },
+  parentNameSubtitle: { fontSize: 13, color: "#4a5568", marginTop: 2 },
   badge: {
     paddingVertical: 4,
     paddingHorizontal: 10,
