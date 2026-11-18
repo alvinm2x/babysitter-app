@@ -1,14 +1,16 @@
 import { supabase } from "@/utils/supabase";
 import { useRouter } from "expo-router";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
   Linking,
+  Modal,
   Platform,
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   TouchableOpacity,
   View,
 } from "react-native";
@@ -45,7 +47,7 @@ const evaluateJobAlert = (req: any) => {
   const jobStart = new Date(jobStartStr);
   const diffHours = (jobStart.getTime() - now.getTime()) / (1000 * 60 * 60);
 
-  // Si la fecha y hora del turno ya quedaron en el pasado y sigue pendiente, lo filtramos (no mostrar como alerta activa)
+  // Si la fecha y hora del turno ya quedaron en el pasado y sigue pendiente, lo filtramos
   if (req.status === "pending" && diffHours < -1) {
     return null;
   }
@@ -137,6 +139,8 @@ const evaluateJobAlert = (req: any) => {
 // -----------------------------------------------------------------------------
 export default function AdminDashboardScreen() {
   const router = useRouter();
+  const chatScrollRef = useRef<ScrollView | null>(null);
+
   const [activeTab, setActiveTab] = useState<"alerts" | "finance">("alerts");
   const [loading, setLoading] = useState(true);
   const [requests, setRequests] = useState<any[]>([]);
@@ -149,13 +153,183 @@ export default function AdminDashboardScreen() {
     [key: string]: boolean;
   }>({});
 
+  // NUEVO: ESTADOS DEL CHAT OPERATIVO DE SOPORTE (ÍTEM #26 FASE 1)
+  const [isChatOpen, setIsChatOpen] = useState(false);
+  const [activeChatReq, setActiveChatReq] = useState<any | null>(null);
+  const [messages, setMessages] = useState<any[]>([]);
+  const [newMessage, setNewMessage] = useState("");
+  const [sendingMessage, setSendingMessage] = useState(false);
+  const [adminUserId, setAdminUserId] = useState<string | null>(null);
+
   const toggleBreakdown = (id: string) => {
     setExpandedBreakdownIds((prev) => ({ ...prev, [id]: !prev[id] }));
   };
 
   useEffect(() => {
     fetchAdminData();
+    supabase.auth.getUser().then(({ data }) => {
+      if (data?.user) setAdminUserId(data.user.id);
+    });
   }, []);
+
+  // MOTOR CHAT REALTIME 2.0 PARA INTERVENCIÓN ADMIN + FALLBACK POLLING 4S
+  useEffect(() => {
+    let chatSub: any = null;
+    let pollInterval: any = null;
+
+    if (isChatOpen && activeChatReq?.id) {
+      const reqId = activeChatReq.id;
+      loadMessages(reqId);
+      const channelName = "admin_chat_" + reqId;
+      supabase.removeChannel(supabase.channel(channelName));
+
+      chatSub = supabase
+        .channel(channelName)
+        .on(
+          "postgres_changes",
+          {
+            event: "INSERT",
+            schema: "public",
+            table: "messages",
+            filter: "request_id=eq." + reqId,
+          },
+          (payload) => {
+            const incoming = payload.new;
+            setMessages((prev) => {
+              const exists = prev.some(
+                (m) =>
+                  m.id === incoming.id ||
+                  (m._optimistic &&
+                    m.sender_id === incoming.sender_id &&
+                    m.content === incoming.content),
+              );
+              if (exists) {
+                return prev.map((m) =>
+                  m._optimistic &&
+                  m.sender_id === incoming.sender_id &&
+                  m.content === incoming.content
+                    ? incoming
+                    : m,
+                );
+              }
+              return [...prev, incoming];
+            });
+          },
+        )
+        .subscribe();
+
+      pollInterval = setInterval(() => {
+        loadMessages(reqId, true);
+      }, 4000);
+    }
+
+    return () => {
+      if (chatSub) supabase.removeChannel(chatSub);
+      if (pollInterval) clearInterval(pollInterval);
+    };
+  }, [isChatOpen, activeChatReq]);
+
+  const loadMessages = async (reqId: string, silent = false) => {
+    try {
+      const { data, error } = await supabase
+        .from("messages")
+        .select("*")
+        .eq("request_id", reqId)
+        .order("created_at", { ascending: true });
+      if (!error && data) {
+        setMessages((prev) => {
+          if (silent && prev.length === data.length) {
+            const lastPrev = prev[prev.length - 1];
+            const lastNew = data[data.length - 1];
+            if (lastPrev?.id === lastNew?.id && !lastPrev?._optimistic) {
+              return prev;
+            }
+          }
+          return data;
+        });
+      }
+    } catch (err) {
+      console.error("Error al cargar mensajes admin:", err);
+    }
+  };
+
+  const handleOpenAdminChat = (req: any) => {
+    setActiveChatReq(req);
+    setMessages([]);
+    setNewMessage("");
+    setIsChatOpen(true);
+  };
+
+  const sendAdminMessage = async () => {
+    const rawText = newMessage.trim();
+    if (!rawText || !activeChatReq?.id || sendingMessage) return;
+
+    const formattedText = rawText.startsWith("[Soporte")
+      ? rawText
+      : `[Soporte MiBabysitter]: ${rawText}`;
+
+    setSendingMessage(true);
+    try {
+      const {
+        data: { user },
+      } = await supabase.auth.getUser();
+      if (!user) return;
+
+      const tempId = "temp_" + Date.now();
+      const optimisticMsg = {
+        id: tempId,
+        request_id: activeChatReq.id,
+        sender_id: user.id,
+        receiver_id: activeChatReq.babysitter_id,
+        content: formattedText,
+        created_at: new Date().toISOString(),
+        _optimistic: true,
+      };
+      setMessages((prev) => [...prev, optimisticMsg]);
+      setNewMessage("");
+
+      const { data: insertedRows, error } = await supabase
+        .from("messages")
+        .insert([
+          {
+            request_id: activeChatReq.id,
+            sender_id: user.id,
+            receiver_id: activeChatReq.babysitter_id,
+            content: formattedText,
+          },
+        ])
+        .select();
+
+      if (error) {
+        setMessages((prev) => prev.filter((m) => m.id !== tempId));
+        setNewMessage(rawText);
+        throw error;
+      }
+
+      if (insertedRows && insertedRows[0]) {
+        const realMsg = insertedRows[0];
+        setMessages((prev) => {
+          const alreadyAdded = prev.some((m) => m.id === realMsg.id);
+          if (alreadyAdded) return prev.filter((m) => m.id !== tempId);
+          return prev.map((m) => (m.id === tempId ? realMsg : m));
+        });
+      }
+
+      if (activeChatReq.babysitter_id) {
+        await supabase.from("notifications").insert([
+          {
+            user_id: activeChatReq.babysitter_id,
+            title: "🛡️ Mensaje de Soporte",
+            message: `Soporte MiBabysitter te escribió en el chat del turno del ${activeChatReq.job_date}.`,
+          },
+        ]);
+      }
+    } catch (err: any) {
+      showAlert("Error al enviar mensaje", err.message);
+    } finally {
+      setSendingMessage(false);
+    }
+  };
 
   const fetchAdminData = async () => {
     setLoading(true);
@@ -298,17 +472,10 @@ export default function AdminDashboardScreen() {
     );
   };
 
-  // APURAR POR CORREO VÍA EDGE FUNCTION (RESEND)
   const handleNudgeByEmail = async (req: any) => {
     setUpdatingId(req.id);
     try {
-      const { data: authData } = await supabase.auth.getUser();
-      const token = (await supabase.auth.getSession()).data.session
-        ?.access_token;
-
-      // Buscamos el email del usuario babysitter en auth o perfiles
       const sitterId = req.babysitter_id;
-      // Invocamos la Edge Function de correos transaccionales
       const { error } = await supabase.functions.invoke(
         "send-email-notification",
         {
@@ -334,7 +501,6 @@ export default function AdminDashboardScreen() {
       );
     } catch (err: any) {
       console.error(err);
-      // Fallback amigable si la Edge Function no responde
       setEmailStatusMap((prev) => ({
         ...prev,
         [req.id]: "✅ Recordatorio registrado",
@@ -345,9 +511,6 @@ export default function AdminDashboardScreen() {
     }
   };
 
-  // ---------------------------------------------------------------------------
-  // RENDERIZADO MULTICANAL DE BOTONES EN TORRE DE CONTROL
-  // ---------------------------------------------------------------------------
   const renderActionButtons = (req: any, alertType: string) => {
     const hasSitterPhone = Boolean(
       req.babysitter?.phone &&
@@ -457,7 +620,6 @@ export default function AdminDashboardScreen() {
               </View>
             )}
 
-            {/* Canal Alternativo Multicanal por Correo */}
             <TouchableOpacity
               style={styles.actionBtnTeal}
               onPress={() => handleNudgeByEmail(req)}
@@ -649,8 +811,18 @@ export default function AdminDashboardScreen() {
                         </Text>
                       </View>
 
-                      <View style={{ marginTop: 8 }}>
+                      <View style={{ marginTop: 8, gap: 8 }}>
                         {renderActionButtons(req, alert.actionType)}
+
+                        {/* NUEVO: BOTÓN DE INTERVENCIÓN CHAT OPERATIVO (ÍTEM #26 FASE 1) */}
+                        <TouchableOpacity
+                          style={styles.actionBtnPurple}
+                          onPress={() => handleOpenAdminChat(req)}
+                        >
+                          <Text style={styles.actionBtnText}>
+                            💬 Abrir Chat Operativo
+                          </Text>
+                        </TouchableOpacity>
                       </View>
                     </View>
                   );
@@ -845,6 +1017,127 @@ export default function AdminDashboardScreen() {
           <Text style={styles.backButtonText}>Volver al Inicio</Text>
         </TouchableOpacity>
       </View>
+
+      {/* MODAL DE CHAT OPERATIVO DE SOPORTE (ÍTEM #26 FASE 1) */}
+      {isChatOpen && activeChatReq && (
+        <Modal
+          visible={isChatOpen}
+          transparent={true}
+          animationType="slide"
+          onRequestClose={() => setIsChatOpen(false)}
+        >
+          <View style={styles.modalOverlay}>
+            <View style={styles.chatModalContent}>
+              <View style={styles.chatHeader}>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.chatModalName}>
+                    🛡️ Chat Operativo (Soporte)
+                  </Text>
+                  <Text
+                    style={{ fontSize: 12, color: "#4a5568", marginTop: 2 }}
+                  >
+                    Niñera: {activeChatReq.babysitter?.first_name || "Niñera"} •
+                    Familia: {activeChatReq.parent?.parent_name || "Familia"}
+                  </Text>
+                  <Text
+                    style={{ fontSize: 11, color: "#38a169", marginTop: 2 }}
+                  >
+                    ● Conectado en tiempo real
+                  </Text>
+                </View>
+                <TouchableOpacity onPress={() => setIsChatOpen(false)}>
+                  <Text style={{ fontSize: 24, color: "#718096" }}>×</Text>
+                </TouchableOpacity>
+              </View>
+
+              <ScrollView
+                ref={chatScrollRef}
+                style={styles.chatScroll}
+                contentContainerStyle={{ padding: 16 }}
+                onContentSizeChange={() =>
+                  chatScrollRef.current?.scrollToEnd({ animated: true })
+                }
+              >
+                {messages.length === 0 ? (
+                  <Text style={styles.emptyText}>
+                    Aún no hay mensajes en este turno. Escribe abajo para
+                    intervenir como Soporte MiBabysitter.
+                  </Text>
+                ) : (
+                  messages.map((msg, idx) => {
+                    const isSupport =
+                      msg.content?.startsWith("[Soporte") ||
+                      (adminUserId &&
+                        msg.sender_id === adminUserId &&
+                        msg.sender_id !== activeChatReq.babysitter_id &&
+                        msg.sender_id !== activeChatReq.parent_id);
+
+                    const senderLabel = isSupport
+                      ? "🛡️ Soporte MiBabysitter"
+                      : msg.sender_id === activeChatReq.babysitter_id
+                        ? `👩‍🍼 ${activeChatReq.babysitter?.first_name || "Niñera"}`
+                        : `👨‍👩‍👧 ${activeChatReq.parent?.parent_name || "Familia"}`;
+
+                    return (
+                      <View
+                        key={msg.id || idx}
+                        style={[
+                          styles.messageBubble,
+                          isSupport ? styles.messageMe : styles.messageThem,
+                          msg._optimistic && { opacity: 0.75 },
+                        ]}
+                      >
+                        <Text
+                          style={[
+                            styles.senderTag,
+                            isSupport
+                              ? { color: "#e9d8fd" }
+                              : { color: "#4a5568" },
+                          ]}
+                        >
+                          {senderLabel}
+                        </Text>
+                        <Text
+                          style={[
+                            styles.messageText,
+                            isSupport
+                              ? styles.messageTextMe
+                              : styles.messageTextThem,
+                          ]}
+                        >
+                          {msg.content}
+                        </Text>
+                      </View>
+                    );
+                  })
+                )}
+              </ScrollView>
+
+              <View style={styles.chatInputRow}>
+                <TextInput
+                  style={styles.chatInput}
+                  placeholder="Escribir como Soporte..."
+                  value={newMessage}
+                  onChangeText={setNewMessage}
+                  onSubmitEditing={sendAdminMessage}
+                  returnKeyType="send"
+                />
+                <TouchableOpacity
+                  style={styles.chatSendButton}
+                  onPress={sendAdminMessage}
+                  disabled={sendingMessage}
+                >
+                  {sendingMessage ? (
+                    <ActivityIndicator color="#fff" size="small" />
+                  ) : (
+                    <Text style={styles.chatSendButtonText}>Enviar</Text>
+                  )}
+                </TouchableOpacity>
+              </View>
+            </View>
+          </View>
+        </Modal>
+      )}
     </View>
   );
 }
@@ -943,6 +1236,12 @@ const styles = StyleSheet.create({
   },
   actionBtnTeal: {
     backgroundColor: "#319795",
+    paddingVertical: 10,
+    borderRadius: 8,
+    alignItems: "center",
+  },
+  actionBtnPurple: {
+    backgroundColor: "#805ad5",
     paddingVertical: 10,
     borderRadius: 8,
     alignItems: "center",
@@ -1061,4 +1360,81 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   backButtonText: { color: "#ffffff", fontSize: 16, fontWeight: "bold" },
+
+  // ESTILOS DEL CHAT OPERATIVO ADMIN
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.5)",
+    justifyContent: "center",
+    alignItems: "center",
+    padding: 16,
+  },
+  chatModalContent: {
+    backgroundColor: "#ffffff",
+    borderRadius: 16,
+    width: "100%",
+    maxWidth: 480,
+    height: "80%",
+    display: "flex",
+    flexDirection: "column",
+  },
+  chatHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    padding: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: "#edf2f7",
+  },
+  chatModalName: { fontSize: 18, fontWeight: "bold", color: "#2d3748" },
+  chatScroll: { flex: 1, backgroundColor: "#f7fafc" },
+  messageBubble: {
+    maxWidth: "82%",
+    padding: 12,
+    borderRadius: 12,
+    marginBottom: 8,
+  },
+  messageMe: {
+    alignSelf: "flex-end",
+    backgroundColor: "#805ad5",
+    borderBottomRightRadius: 4,
+  },
+  messageThem: {
+    alignSelf: "flex-start",
+    backgroundColor: "#e2e8f0",
+    borderBottomLeftRadius: 4,
+  },
+  senderTag: {
+    fontSize: 11,
+    fontWeight: "bold",
+    marginBottom: 4,
+  },
+  messageText: { fontSize: 15 },
+  messageTextMe: { color: "#ffffff" },
+  messageTextThem: { color: "#2d3748" },
+  chatInputRow: {
+    flexDirection: "row",
+    padding: 12,
+    borderTopWidth: 1,
+    borderTopColor: "#edf2f7",
+    backgroundColor: "#ffffff",
+  },
+  chatInput: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: "#cbd5e0",
+    borderRadius: 20,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    fontSize: 15,
+    backgroundColor: "#f8fafc",
+    marginRight: 8,
+  },
+  chatSendButton: {
+    backgroundColor: "#805ad5",
+    paddingHorizontal: 16,
+    justifyContent: "center",
+    borderRadius: 20,
+  },
+  chatSendButtonText: { color: "#ffffff", fontWeight: "bold" },
 });
