@@ -1,6 +1,6 @@
 import { supabase } from "@/utils/supabase";
 import { useRouter } from "expo-router";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -148,6 +148,7 @@ const buildGoogleCalendarDates = (jobDate?: string, jobTime?: string) => {
 
 export default function ParentHomeScreen() {
   const router = useRouter();
+  const chatScrollRef = useRef<ScrollView | null>(null);
 
   const [activeTab, setActiveTab] = useState<"nannies" | "history" | "profile">(
     "nannies",
@@ -203,6 +204,13 @@ export default function ParentHomeScreen() {
   });
   const [profileLoading, setProfileLoading] = useState(false);
   const [profileSaveSuccess, setProfileSaveSuccess] = useState(false);
+
+  // NUEVO: ESTADOS DEL GATEKEEPER JUST-IN-TIME (ÍTEM #22 FASE 1)
+  const [showOnboardingGateModal, setShowOnboardingGateModal] = useState(false);
+  const [pendingSitterIdForGate, setPendingSitterIdForGate] = useState<
+    string | null
+  >(null);
+  const [savingGateProfile, setSavingGateProfile] = useState(false);
 
   const toggleBreakdown = (id: string) => {
     setExpandedBreakdownIds((prev) => ({ ...prev, [id]: !prev[id] }));
@@ -268,15 +276,18 @@ export default function ParentHomeScreen() {
     };
   }, []);
 
+  // MOTOR CHAT REALTIME 2.0 + FALLBACK POLLING CADA 4 SEGUNDOS
   useEffect(() => {
     let chatSub: any = null;
+    let pollInterval: any = null;
 
     if (isChatOpen && activeRequestId) {
       loadMessages(activeRequestId);
-      supabase.removeChannel(supabase.channel("chat_" + activeRequestId));
+      const channelName = "parent_chat_" + activeRequestId;
+      supabase.removeChannel(supabase.channel(channelName));
 
       chatSub = supabase
-        .channel("chat_" + activeRequestId)
+        .channel(channelName)
         .on(
           "postgres_changes",
           {
@@ -286,14 +297,40 @@ export default function ParentHomeScreen() {
             filter: "request_id=eq." + activeRequestId,
           },
           (payload) => {
-            setMessages((prev) => [...prev, payload.new]);
+            const incoming = payload.new;
+            setMessages((prev) => {
+              // Evitar duplicados si ya se insertó por Optimistic UI
+              const exists = prev.some(
+                (m) =>
+                  m.id === incoming.id ||
+                  (m._optimistic &&
+                    m.sender_id === incoming.sender_id &&
+                    m.content === incoming.content),
+              );
+              if (exists) {
+                return prev.map((m) =>
+                  m._optimistic &&
+                  m.sender_id === incoming.sender_id &&
+                  m.content === incoming.content
+                    ? incoming
+                    : m,
+                );
+              }
+              return [...prev, incoming];
+            });
           },
         )
         .subscribe();
+
+      // Polling silencioso de respaldo cada 4s por si la red móvil corta el WebSocket
+      pollInterval = setInterval(() => {
+        loadMessages(activeRequestId, true);
+      }, 4000);
     }
 
     return () => {
       if (chatSub) supabase.removeChannel(chatSub);
+      if (pollInterval) clearInterval(pollInterval);
     };
   }, [isChatOpen, activeRequestId]);
 
@@ -306,21 +343,35 @@ export default function ParentHomeScreen() {
     selectedGlobalEndTime,
   ]);
 
-  const loadMessages = async (reqId: string) => {
+  const loadMessages = async (reqId: string, silent = false) => {
     try {
       const { data, error } = await supabase
         .from("messages")
         .select("*")
         .eq("request_id", reqId)
         .order("created_at", { ascending: true });
-      if (!error && data) setMessages(data);
+      if (!error && data) {
+        setMessages((prev) => {
+          if (silent && prev.length === data.length) {
+            const lastPrev = prev[prev.length - 1];
+            const lastNew = data[data.length - 1];
+            if (lastPrev?.id === lastNew?.id && !lastPrev?._optimistic) {
+              return prev;
+            }
+          }
+          return data;
+        });
+      }
     } catch (err) {
       console.error(err);
     }
   };
 
   const sendMessage = async () => {
-    if (!newMessage.trim() || !activeRequestId || !activeChatSitter) return;
+    const textToSend = newMessage.trim();
+    if (!textToSend || !activeRequestId || !activeChatSitter || sendingMessage)
+      return;
+
     setSendingMessage(true);
     try {
       const {
@@ -328,19 +379,51 @@ export default function ParentHomeScreen() {
       } = await supabase.auth.getUser();
       if (!user) return;
 
-      const { error } = await supabase
+      // 1. OPTIMISTIC UI: Mostrar el mensaje en pantalla en 0 ms
+      const tempId = "temp_" + Date.now();
+      const optimisticMsg = {
+        id: tempId,
+        request_id: activeRequestId,
+        sender_id: user.id,
+        receiver_id: activeChatSitter.id,
+        content: textToSend,
+        created_at: new Date().toISOString(),
+        _optimistic: true,
+      };
+      setMessages((prev) => [...prev, optimisticMsg]);
+      setNewMessage("");
+
+      // 2. Insertar en Supabase y recuperar la fila real
+      const { data: insertedRows, error } = await supabase
         .from("messages")
         .insert([
           {
             request_id: activeRequestId,
             sender_id: user.id,
             receiver_id: activeChatSitter.id,
-            content: newMessage.trim(),
+            content: textToSend,
           },
-        ]);
-      if (error) throw error;
+        ])
+        .select();
 
-      setNewMessage("");
+      if (error) {
+        // Si falló, revertimos la burbuja temporal y devolvemos el texto
+        setMessages((prev) => prev.filter((m) => m.id !== tempId));
+        setNewMessage(textToSend);
+        throw error;
+      }
+
+      if (insertedRows && insertedRows[0]) {
+        const realMsg = insertedRows[0];
+        setMessages((prev) => {
+          const alreadyAddedByRealtime = prev.some((m) => m.id === realMsg.id);
+          if (alreadyAddedByRealtime) {
+            return prev.filter((m) => m.id !== tempId);
+          }
+          return prev.map((m) => (m.id === tempId ? realMsg : m));
+        });
+      }
+
       await sendNotificationToSitter(
         activeChatSitter.id,
         "💬 Nuevo Mensaje",
@@ -453,7 +536,16 @@ export default function ParentHomeScreen() {
 
       const { data, error } = await query;
       if (error) throw error;
-      setBabysitters(data || []);
+
+      // GATEKEEPER DE VISIBILIDAD: Filtramos perfiles que tengan tarifa >= 10000 y nombre
+      // (Y si ya tienen solicitudes activas o teléfono configurado, se muestran)
+      const validSitters = (data || []).filter((s) => {
+        const hasMinRate = Number(s.hourly_rate) >= 10000;
+        const hasName = Boolean(s.first_name && s.first_name.trim());
+        return hasMinRate && hasName;
+      });
+
+      setBabysitters(validSitters);
     } catch (error: any) {
       console.error("Error al cargar niñeras:", error.message);
     } finally {
@@ -538,6 +630,97 @@ export default function ParentHomeScreen() {
   const handleOpenSitterModal = (sitter: any) => {
     setSelectedSitter(sitter);
     setShowModalPriceBreakdown(false);
+  };
+
+  // NUEVO: VALIDACIÓN GATEKEEPER ANTES DE ENVIAR LA SOLICITUD (ÍTEM #22 FASE 1)
+  const handleInitiateRequestBabysitter = (babysitterId: string) => {
+    const startMins = timeToMinutes(selectedGlobalStartTime);
+    const endMins = timeToMinutes(selectedGlobalEndTime);
+
+    if (endMins - startMins < 120) {
+      showAlert(
+        "Duración insuficiente",
+        "El servicio requiere un mínimo de 2 horas.",
+      );
+      return;
+    }
+
+    const hasPhone =
+      parentProfile.phone && parentProfile.phone.replace(/\D/g, "").length >= 8;
+    const hasAddress =
+      parentProfile.address && parentProfile.address.trim().length >= 5;
+    const hasChildrenInfo =
+      parentProfile.children_info &&
+      parentProfile.children_info.trim().length >= 2;
+
+    if (!hasPhone || !hasAddress || !hasChildrenInfo) {
+      setPendingSitterIdForGate(babysitterId);
+      setShowOnboardingGateModal(true);
+      return;
+    }
+
+    confirmRequestBabysitter(babysitterId);
+  };
+
+  // GUARDAR DATOS MÍNIMOS EN EL MODAL GATEKEEPER Y DISPARAR LA SOLICITUD DE INMEDIATO
+  const handleSaveGateAndSubmitRequest = async () => {
+    const cleanDigits = (parentProfile.phone || "").replace(/\D/g, "");
+    if (cleanDigits.length < 8) {
+      showAlert(
+        "Teléfono requerido",
+        "Por favor ingresa un número de teléfono (WhatsApp) válido para coordinar el turno.",
+      );
+      return;
+    }
+    if (!parentProfile.address || parentProfile.address.trim().length < 5) {
+      showAlert(
+        "Dirección y Comuna requeridas",
+        "Por favor indica tu dirección y comuna para que la niñera sepa dónde realizar el cuidado.",
+      );
+      return;
+    }
+    if (
+      !parentProfile.children_info ||
+      parentProfile.children_info.trim().length < 2
+    ) {
+      showAlert(
+        "Información de los niños requerida",
+        "Indica brevemente cuántos niños son y sus edades (ej: 1 niño de 3 años).",
+      );
+      return;
+    }
+
+    setSavingGateProfile(true);
+    try {
+      const {
+        data: { user },
+      } = await supabase.auth.getUser();
+      if (!user) throw new Error("No hay sesión activa");
+
+      const updates = {
+        id: user.id,
+        phone: parentProfile.phone.trim(),
+        address: parentProfile.address.trim(),
+        children_info: parentProfile.children_info.trim(),
+        emergency_contact: (parentProfile.emergency_contact || "").trim(),
+        updated_at: new Date(),
+      };
+
+      const { error } = await supabase.from("parent_profiles").upsert(updates);
+      if (error) throw error;
+
+      setShowOnboardingGateModal(false);
+      const targetSitterId = pendingSitterIdForGate || selectedSitter?.id;
+      setPendingSitterIdForGate(null);
+
+      if (targetSitterId) {
+        await confirmRequestBabysitter(targetSitterId);
+      }
+    } catch (error: any) {
+      showAlert("Error al guardar tus datos", error.message);
+    } finally {
+      setSavingGateProfile(false);
+    }
   };
 
   const confirmRequestBabysitter = async (babysitterId: string) => {
@@ -737,16 +920,14 @@ export default function ParentHomeScreen() {
 
       const sitterIdToReview =
         reviewingSitter.babysitter_id || reviewingSitter.id;
-      const { error: revError } = await supabase
-        .from("reviews")
-        .insert([
-          {
-            babysitter_id: sitterIdToReview,
-            parent_id: user.id,
-            rating: reviewRating,
-            comment: reviewComment,
-          },
-        ]);
+      const { error: revError } = await supabase.from("reviews").insert([
+        {
+          babysitter_id: sitterIdToReview,
+          parent_id: user.id,
+          rating: reviewRating,
+          comment: reviewComment,
+        },
+      ]);
       if (revError) throw revError;
 
       const { data: allReviews, error: fetchErr } = await supabase
@@ -1642,7 +1823,7 @@ export default function ParentHomeScreen() {
               <Text style={styles.inputLabel}>Dirección / Comuna</Text>
               <TextInput
                 style={styles.input}
-                placeholder="Ej: Av. Providencia 1234, Depto 501"
+                placeholder="Ej: Av. Providencia 1234, Depto 501, Providencia"
                 value={parentProfile.address}
                 onChangeText={(text) =>
                   setParentProfile({ ...parentProfile, address: text })
@@ -1857,7 +2038,6 @@ export default function ParentHomeScreen() {
                   </TouchableOpacity>
                 </View>
 
-                {/* NUEVO: FASE 4 - DISCLAIMER LEGAL Y TRIBUTARIO */}
                 <View style={styles.legalDisclaimerBox}>
                   <Text style={styles.legalDisclaimerText}>
                     📝{" "}
@@ -1885,7 +2065,9 @@ export default function ParentHomeScreen() {
                     requestingId === selectedSitter.id &&
                       styles.requestButtonDisabled,
                   ]}
-                  onPress={() => confirmRequestBabysitter(selectedSitter.id)}
+                  onPress={() =>
+                    handleInitiateRequestBabysitter(selectedSitter.id)
+                  }
                   disabled={requestingId === selectedSitter.id}
                 >
                   {requestingId === selectedSitter.id ? (
@@ -1902,6 +2084,121 @@ export default function ParentHomeScreen() {
                   onPress={() => setSelectedSitter(null)}
                 >
                   <Text style={styles.closeModalText}>Cancelar</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          </View>
+        </Modal>
+      )}
+
+      {/* NUEVO: MODAL GATEKEEPER JUST-IN-TIME DE DATOS MÍNIMOS (ÍTEM #22 FASE 1) */}
+      {showOnboardingGateModal && (
+        <Modal
+          visible={showOnboardingGateModal}
+          transparent={true}
+          animationType="slide"
+          onRequestClose={() => setShowOnboardingGateModal(false)}
+        >
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalContent}>
+              <ScrollView showsVerticalScrollIndicator={false}>
+                <Text style={styles.modalName}>
+                  📍 ¡Último paso para tu solicitud!
+                </Text>
+                <Text
+                  style={{
+                    textAlign: "center",
+                    color: "#4a5568",
+                    fontSize: 14,
+                    marginBottom: 16,
+                    lineHeight: 20,
+                  }}
+                >
+                  Para que{" "}
+                  <Text style={{ fontWeight: "bold" }}>
+                    {selectedSitter?.first_name || "la niñera"}
+                  </Text>{" "}
+                  pueda evaluar su traslado y aceptar tu turno, completa estos
+                  datos una sola vez (quedarán guardados en tu perfil):
+                </Text>
+
+                <Text style={styles.inputLabel}>
+                  1. Dirección y Comuna del Cuidado *
+                </Text>
+                <TextInput
+                  style={styles.input}
+                  placeholder="Ej: Av. Las Condes 9000, Depto 402, Las Condes"
+                  value={parentProfile.address}
+                  onChangeText={(text) =>
+                    setParentProfile({ ...parentProfile, address: text })
+                  }
+                />
+
+                <Text style={styles.inputLabel}>
+                  2. Tu Teléfono (WhatsApp) *
+                </Text>
+                <TextInput
+                  style={styles.input}
+                  placeholder="+56 9 1234 5678"
+                  value={parentProfile.phone}
+                  onChangeText={(text) =>
+                    setParentProfile({ ...parentProfile, phone: text })
+                  }
+                  keyboardType="phone-pad"
+                />
+
+                <Text style={styles.inputLabel}>
+                  3. Niños a cuidar (Cantidad y edades) *
+                </Text>
+                <TextInput
+                  style={[styles.input, { height: 76 }]}
+                  placeholder="Ej: 2 niños (3 y 6 años). Sin alergias."
+                  value={parentProfile.children_info}
+                  onChangeText={(text) =>
+                    setParentProfile({ ...parentProfile, children_info: text })
+                  }
+                  multiline
+                />
+
+                <Text style={styles.inputLabel}>
+                  4. Contacto de Emergencia (Opcional)
+                </Text>
+                <TextInput
+                  style={styles.input}
+                  placeholder="Nombre y teléfono de un familiar"
+                  value={parentProfile.emergency_contact}
+                  onChangeText={(text) =>
+                    setParentProfile({
+                      ...parentProfile,
+                      emergency_contact: text,
+                    })
+                  }
+                />
+              </ScrollView>
+
+              <View style={styles.modalActions}>
+                <TouchableOpacity
+                  style={[
+                    styles.requestButton,
+                    { backgroundColor: "#d69e2e" },
+                    savingGateProfile && styles.requestButtonDisabled,
+                  ]}
+                  onPress={handleSaveGateAndSubmitRequest}
+                  disabled={savingGateProfile}
+                >
+                  {savingGateProfile ? (
+                    <ActivityIndicator color="#fff" />
+                  ) : (
+                    <Text style={styles.requestButtonText}>
+                      ✅ Guardar y Enviar Solicitud Ahora
+                    </Text>
+                  )}
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.closeModalButton}
+                  onPress={() => setShowOnboardingGateModal(false)}
+                >
+                  <Text style={styles.closeModalText}>Volver</Text>
                 </TouchableOpacity>
               </View>
             </View>
@@ -2059,16 +2356,25 @@ export default function ParentHomeScreen() {
           <View style={styles.modalOverlay}>
             <View style={styles.chatModalContent}>
               <View style={styles.chatHeader}>
-                <Text style={styles.chatModalName}>
-                  Chat con {activeChatSitter?.first_name}
-                </Text>
+                <View>
+                  <Text style={styles.chatModalName}>
+                    Chat con {activeChatSitter?.first_name}
+                  </Text>
+                  <Text style={{ fontSize: 12, color: "#38a169" }}>
+                    ● Conectado en tiempo real
+                  </Text>
+                </View>
                 <TouchableOpacity onPress={() => setIsChatOpen(false)}>
                   <Text style={{ fontSize: 24, color: "#718096" }}>×</Text>
                 </TouchableOpacity>
               </View>
               <ScrollView
+                ref={chatScrollRef}
                 style={styles.chatScroll}
                 contentContainerStyle={{ padding: 16 }}
+                onContentSizeChange={() =>
+                  chatScrollRef.current?.scrollToEnd({ animated: true })
+                }
               >
                 {messages.length === 0 ? (
                   <Text style={styles.emptyText}>
@@ -2083,6 +2389,7 @@ export default function ParentHomeScreen() {
                         style={[
                           styles.messageBubble,
                           isMe ? styles.messageMe : styles.messageThem,
+                          msg._optimistic && { opacity: 0.75 },
                         ]}
                       >
                         <Text
@@ -2106,6 +2413,8 @@ export default function ParentHomeScreen() {
                   placeholder="Escribe un mensaje..."
                   value={newMessage}
                   onChangeText={setNewMessage}
+                  onSubmitEditing={sendMessage}
+                  returnKeyType="send"
                 />
                 <TouchableOpacity
                   style={styles.chatSendButton}
@@ -2433,7 +2742,6 @@ const styles = StyleSheet.create({
     borderRadius: 6,
   },
 
-  // NUEVO: ESTILOS FASE 4 (DISCLAIMER LEGAL)
   legalDisclaimerBox: {
     backgroundColor: "#f7fafc",
     padding: 12,
@@ -2594,7 +2902,7 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     fontSize: 15,
     color: "#2d3748",
-    marginBottom: 20,
+    marginBottom: 16,
   },
   textArea: { height: 100, textAlignVertical: "top" },
   saveButton: {
@@ -2690,19 +2998,6 @@ const styles = StyleSheet.create({
   },
   modalBioText: { fontSize: 15, color: "#4a5568", lineHeight: 22 },
   modalEmptySkills: { fontSize: 14, color: "#a0aec0", fontStyle: "italic" },
-
-  modalChipScroll: { gap: 8, paddingBottom: 4 },
-  modalChip: {
-    paddingVertical: 8,
-    paddingHorizontal: 14,
-    borderRadius: 20,
-    backgroundColor: "#edf2f7",
-    borderWidth: 1,
-    borderColor: "#cbd5e0",
-  },
-  modalChipSelected: { backgroundColor: "#ebf8ff", borderColor: "#3182ce" },
-  modalChipText: { fontSize: 13, fontWeight: "600", color: "#4a5568" },
-  modalChipTextSelected: { color: "#2b6cb0", fontWeight: "bold" },
 
   skillsContainer: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
   skillBadge: {

@@ -1,6 +1,6 @@
 import { supabase } from "@/utils/supabase";
 import { useRouter } from "expo-router";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -97,6 +97,7 @@ const getHoursFromTimeRange = (jobTime?: string) => {
 
 export default function BabysitterHomeScreen() {
   const router = useRouter();
+  const chatScrollRef = useRef<ScrollView | null>(null);
 
   const [activeTab, setActiveTab] = useState<
     "requests" | "history" | "profile"
@@ -114,6 +115,9 @@ export default function BabysitterHomeScreen() {
 
   const [firstName, setFirstName] = useState("");
   const [lastName, setLastName] = useState("");
+  const [phone, setPhone] = useState("");
+  const [quickPhoneInput, setQuickPhoneInput] = useState("");
+  const [savingQuickPhone, setSavingQuickPhone] = useState(false);
   const [bio, setBio] = useState("");
   const [hourlyRate, setHourlyRate] = useState("");
   const [experience, setExperience] = useState("");
@@ -152,7 +156,6 @@ export default function BabysitterHomeScreen() {
       } = await supabase.auth.getUser();
 
       if (user) {
-        // CORRECCIÓN REALTIME: Limpiamos los canales antes de suscribirnos (útil para Hot-Reload en localhost)
         supabase.removeChannel(
           supabase.channel("babysitter_realtime_requests"),
         );
@@ -200,15 +203,18 @@ export default function BabysitterHomeScreen() {
     };
   }, []);
 
+  // MOTOR CHAT REALTIME 2.0 + FALLBACK POLLING CADA 4 SEGUNDOS
   useEffect(() => {
     let chatSub: any = null;
+    let pollInterval: any = null;
 
     if (isChatOpen && activeRequestId) {
       loadMessages(activeRequestId);
-      supabase.removeChannel(supabase.channel("chat_" + activeRequestId));
+      const channelName = "sitter_chat_" + activeRequestId;
+      supabase.removeChannel(supabase.channel(channelName));
 
       chatSub = supabase
-        .channel("chat_" + activeRequestId)
+        .channel(channelName)
         .on(
           "postgres_changes",
           {
@@ -218,50 +224,121 @@ export default function BabysitterHomeScreen() {
             filter: "request_id=eq." + activeRequestId,
           },
           (payload) => {
-            setMessages((prev) => [...prev, payload.new]);
+            const incoming = payload.new;
+            setMessages((prev) => {
+              const exists = prev.some(
+                (m) =>
+                  m.id === incoming.id ||
+                  (m._optimistic &&
+                    m.sender_id === incoming.sender_id &&
+                    m.content === incoming.content),
+              );
+              if (exists) {
+                return prev.map((m) =>
+                  m._optimistic &&
+                  m.sender_id === incoming.sender_id &&
+                  m.content === incoming.content
+                    ? incoming
+                    : m,
+                );
+              }
+              return [...prev, incoming];
+            });
           },
         )
         .subscribe();
+
+      pollInterval = setInterval(() => {
+        loadMessages(activeRequestId, true);
+      }, 4000);
     }
 
     return () => {
       if (chatSub) supabase.removeChannel(chatSub);
+      if (pollInterval) clearInterval(pollInterval);
     };
   }, [isChatOpen, activeRequestId]);
 
-  const loadMessages = async (reqId: string) => {
+  const loadMessages = async (reqId: string, silent = false) => {
     try {
       const { data, error } = await supabase
         .from("messages")
         .select("*")
         .eq("request_id", reqId)
         .order("created_at", { ascending: true });
-      if (!error && data) setMessages(data);
+      if (!error && data) {
+        setMessages((prev) => {
+          if (silent && prev.length === data.length) {
+            const lastPrev = prev[prev.length - 1];
+            const lastNew = data[data.length - 1];
+            if (lastPrev?.id === lastNew?.id && !lastPrev?._optimistic) {
+              return prev;
+            }
+          }
+          return data;
+        });
+      }
     } catch (err) {
       console.error(err);
     }
   };
 
   const sendMessage = async () => {
-    if (!newMessage.trim() || !activeRequestId || !activeChatParent) return;
+    const textToSend = newMessage.trim();
+    if (!textToSend || !activeRequestId || !activeChatParent || sendingMessage)
+      return;
+
     setSendingMessage(true);
     try {
       const {
         data: { user },
       } = await supabase.auth.getUser();
       if (!user) return;
-      const { error } = await supabase
+
+      // 1. OPTIMISTIC UI: Mostrar el mensaje en pantalla en 0 ms
+      const tempId = "temp_" + Date.now();
+      const optimisticMsg = {
+        id: tempId,
+        request_id: activeRequestId,
+        sender_id: user.id,
+        receiver_id: activeChatParent.id,
+        content: textToSend,
+        created_at: new Date().toISOString(),
+        _optimistic: true,
+      };
+      setMessages((prev) => [...prev, optimisticMsg]);
+      setNewMessage("");
+
+      // 2. Insertar en Supabase y recuperar la fila real
+      const { data: insertedRows, error } = await supabase
         .from("messages")
         .insert([
           {
             request_id: activeRequestId,
             sender_id: user.id,
             receiver_id: activeChatParent.id,
-            content: newMessage.trim(),
+            content: textToSend,
           },
-        ]);
-      if (error) throw error;
-      setNewMessage("");
+        ])
+        .select();
+
+      if (error) {
+        setMessages((prev) => prev.filter((m) => m.id !== tempId));
+        setNewMessage(textToSend);
+        throw error;
+      }
+
+      if (insertedRows && insertedRows[0]) {
+        const realMsg = insertedRows[0];
+        setMessages((prev) => {
+          const alreadyAddedByRealtime = prev.some((m) => m.id === realMsg.id);
+          if (alreadyAddedByRealtime) {
+            return prev.filter((m) => m.id !== tempId);
+          }
+          return prev.map((m) => (m.id === tempId ? realMsg : m));
+        });
+      }
+
       await sendNotificationToParent(
         activeChatParent.id,
         "💬 Nuevo Mensaje",
@@ -510,6 +587,8 @@ export default function BabysitterHomeScreen() {
     if (data) {
       setFirstName(data.first_name || "");
       setLastName(data.last_name || "");
+      setPhone(data.phone || "");
+      setQuickPhoneInput(data.phone || "");
       setBio(data.bio || "");
       if (data.hourly_rate)
         setHourlyRate(formatCurrencyInput(data.hourly_rate.toString()));
@@ -528,9 +607,54 @@ export default function BabysitterHomeScreen() {
     setLoadingProfile(false);
   };
 
+  // GUARDADO RÁPIDO DE TELÉFONO EN 1 CLIC DESDE EL BANNER SUPERIOR
+  const handleQuickSavePhone = async () => {
+    const cleanDigits = quickPhoneInput.replace(/\D/g, "");
+    if (cleanDigits.length < 8) {
+      showAlert(
+        "Teléfono inválido",
+        "Por favor ingresa un número de WhatsApp válido (ej: +56 9 1234 5678).",
+      );
+      return;
+    }
+
+    setSavingQuickPhone(true);
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      if (!session) return;
+
+      const { error } = await supabase.from("babysitter_profiles").upsert({
+        id: session.user.id,
+        phone: quickPhoneInput.trim(),
+        updated_at: new Date(),
+      });
+      if (error) throw error;
+
+      setPhone(quickPhoneInput.trim());
+      showAlert(
+        "¡Teléfono guardado! ✅",
+        "Tu número de WhatsApp quedó registrado para tus turnos y alertas.",
+      );
+    } catch (err: any) {
+      showAlert("Error al guardar teléfono", err.message);
+    } finally {
+      setSavingQuickPhone(false);
+    }
+  };
+
   const saveProfile = async () => {
     if (!firstName || !lastName || !bio || !hourlyRate || !experience) {
       showAlert("Error", "Por favor completa todos los campos de texto.");
+      return;
+    }
+    const cleanPhoneDigits = (phone || "").replace(/\D/g, "");
+    if (cleanPhoneDigits.length < 8) {
+      showAlert(
+        "Teléfono requerido",
+        "Por favor ingresa tu número de teléfono (WhatsApp) para poder coordinar tus turnos.",
+      );
       return;
     }
     if (
@@ -566,6 +690,7 @@ export default function BabysitterHomeScreen() {
       id: session.user.id,
       first_name: firstName,
       last_name: lastName,
+      phone: phone.trim(),
       bio,
       hourly_rate: numericRate,
       experience_years: Number(experience),
@@ -630,6 +755,7 @@ export default function BabysitterHomeScreen() {
   const unreadNotificationsCount = notifications.filter(
     (n) => !n.is_read,
   ).length;
+  const hasValidPhone = (phone || "").replace(/\D/g, "").length >= 8;
 
   const getPaymentStatusBadge = (paymentStatus?: string) => {
     switch (paymentStatus) {
@@ -684,6 +810,39 @@ export default function BabysitterHomeScreen() {
             )}
           </TouchableOpacity>
         </View>
+
+        {/* BANNER DE ACTIVACIÓN RÁPIDA DE TELÉFONO (ÍTEM #22 FASE 3) */}
+        {!loadingProfile && !hasValidPhone && (
+          <View style={styles.phoneGateBanner}>
+            <Text style={styles.phoneGateTitle}>
+              📱 Registra tu WhatsApp para operar
+            </Text>
+            <Text style={styles.phoneGateSub}>
+              Necesitamos tu número para coordinar tus turnos confirmados con
+              las familias y enviarte avisos urgentes.
+            </Text>
+            <View style={styles.phoneGateRow}>
+              <TextInput
+                style={styles.phoneGateInput}
+                placeholder="+56 9 1234 5678"
+                value={quickPhoneInput}
+                onChangeText={setQuickPhoneInput}
+                keyboardType="phone-pad"
+              />
+              <TouchableOpacity
+                style={styles.phoneGateBtn}
+                onPress={handleQuickSavePhone}
+                disabled={savingQuickPhone}
+              >
+                {savingQuickPhone ? (
+                  <ActivityIndicator color="#fff" size="small" />
+                ) : (
+                  <Text style={styles.phoneGateBtnText}>Guardar</Text>
+                )}
+              </TouchableOpacity>
+            </View>
+          </View>
+        )}
 
         <View style={styles.tabContainer}>
           <TouchableOpacity
@@ -793,6 +952,11 @@ export default function BabysitterHomeScreen() {
                             ⏰ Horario: {req.job_time || "No especificado"} (
                             {reqHours} hrs)
                           </Text>
+                          {parentInfo.address ? (
+                            <Text style={styles.jobDetailsText}>
+                              📍 Sector: {parentInfo.address}
+                            </Text>
+                          ) : null}
                         </View>
                       )}
 
@@ -841,7 +1005,6 @@ export default function BabysitterHomeScreen() {
                             </Text>
                           </View>
 
-                          {/* FASE 4: AVISO LEGAL Y DE TRANSPARENCIA EN SOLICITUDES ACTIVAS */}
                           <View style={styles.legalDisclaimerBox}>
                             <Text style={styles.legalDisclaimerText}>
                               📝{" "}
@@ -1176,7 +1339,6 @@ export default function BabysitterHomeScreen() {
                                 </Text>
                               </View>
 
-                              {/* FASE 4: AVISO LEGAL Y DE TRANSPARENCIA EN EL HISTORIAL */}
                               <View style={styles.legalDisclaimerBox}>
                                 <Text style={styles.legalDisclaimerText}>
                                   📝{" "}
@@ -1261,6 +1423,17 @@ export default function BabysitterHomeScreen() {
                     placeholder="Ej: Pérez"
                     value={lastName}
                     onChangeText={setLastName}
+                  />
+                  <Text style={styles.label}>Teléfono (WhatsApp) *</Text>
+                  <TextInput
+                    style={styles.input}
+                    placeholder="+56 9 1234 5678"
+                    value={phone}
+                    onChangeText={(val) => {
+                      setPhone(val);
+                      setQuickPhoneInput(val);
+                    }}
+                    keyboardType="phone-pad"
                   />
                   <Text style={styles.label}>Sobre ti (Biografía corta)</Text>
                   <TextInput
@@ -1489,15 +1662,24 @@ export default function BabysitterHomeScreen() {
           <View style={styles.modalOverlay}>
             <View style={styles.chatModalContent}>
               <View style={styles.chatHeader}>
-                <Text style={styles.chatModalName}>Chat con la Familia</Text>
+                <View>
+                  <Text style={styles.chatModalName}>Chat con la Familia</Text>
+                  <Text style={{ fontSize: 12, color: "#38a169" }}>
+                    ● Conectado en tiempo real
+                  </Text>
+                </View>
                 <TouchableOpacity onPress={() => setIsChatOpen(false)}>
                   <Text style={{ fontSize: 24, color: "#718096" }}>×</Text>
                 </TouchableOpacity>
               </View>
 
               <ScrollView
+                ref={chatScrollRef}
                 style={styles.chatScroll}
                 contentContainerStyle={{ padding: 16 }}
+                onContentSizeChange={() =>
+                  chatScrollRef.current?.scrollToEnd({ animated: true })
+                }
               >
                 {messages.length === 0 ? (
                   <Text style={styles.emptyText}>
@@ -1512,6 +1694,7 @@ export default function BabysitterHomeScreen() {
                         style={[
                           styles.messageBubble,
                           isMe ? styles.messageMe : styles.messageThem,
+                          msg._optimistic && { opacity: 0.75 },
                         ]}
                       >
                         <Text
@@ -1536,6 +1719,8 @@ export default function BabysitterHomeScreen() {
                   placeholder="Escribe un mensaje..."
                   value={newMessage}
                   onChangeText={setNewMessage}
+                  onSubmitEditing={sendMessage}
+                  returnKeyType="send"
                 />
                 <TouchableOpacity
                   style={styles.chatSendButton}
@@ -1604,6 +1789,56 @@ const styles = StyleSheet.create({
     borderColor: "#f7fafc",
   },
   badgeCountText: { color: "#fff", fontSize: 10, fontWeight: "bold" },
+
+  phoneGateBanner: {
+    width: "90%",
+    maxWidth: 500,
+    backgroundColor: "#fffaf0",
+    borderWidth: 1,
+    borderColor: "#fbd38d",
+    borderLeftWidth: 4,
+    borderLeftColor: "#d69e2e",
+    borderRadius: 12,
+    padding: 16,
+    marginBottom: 20,
+  },
+  phoneGateTitle: {
+    fontSize: 15,
+    fontWeight: "bold",
+    color: "#9c4221",
+    marginBottom: 4,
+  },
+  phoneGateSub: {
+    fontSize: 13,
+    color: "#744210",
+    marginBottom: 12,
+    lineHeight: 18,
+  },
+  phoneGateRow: {
+    flexDirection: "row",
+    gap: 8,
+  },
+  phoneGateInput: {
+    flex: 1,
+    backgroundColor: "#ffffff",
+    borderWidth: 1,
+    borderColor: "#fbd38d",
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    fontSize: 14,
+  },
+  phoneGateBtn: {
+    backgroundColor: "#d69e2e",
+    paddingHorizontal: 16,
+    justifyContent: "center",
+    borderRadius: 8,
+  },
+  phoneGateBtnText: {
+    color: "#ffffff",
+    fontWeight: "bold",
+    fontSize: 14,
+  },
 
   tabContainer: {
     flexDirection: "row",
@@ -1725,7 +1960,6 @@ const styles = StyleSheet.create({
   },
   paymentStatusPillText: { fontSize: 12, fontWeight: "bold" },
 
-  // NUEVO: ESTILOS FASE 4 (DISCLAIMER LEGAL NIÑERA)
   legalDisclaimerBox: {
     backgroundColor: "#f7fafc",
     padding: 10,
