@@ -1,5 +1,5 @@
 import { supabase } from "@/utils/supabase";
-import { useRouter } from "expo-router";
+import { useLocalSearchParams, useRouter } from "expo-router";
 import { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
@@ -148,11 +148,20 @@ const buildGoogleCalendarDates = (jobDate?: string, jobTime?: string) => {
 
 export default function ParentHomeScreen() {
   const router = useRouter();
+  const { requestId: paramRequestId } = useLocalSearchParams<{
+    requestId?: string;
+  }>();
+
+  const mainScrollRef = useRef<ScrollView | null>(null);
+  const cardPositionsRef = useRef<{ [key: string]: number }>({});
   const chatScrollRef = useRef<ScrollView | null>(null);
 
   const [activeTab, setActiveTab] = useState<"nannies" | "history" | "profile">(
     "nannies",
   );
+  const [highlightedRequestId, setHighlightedRequestId] = useState<
+    string | null
+  >(null);
   const [loadingAuth, setLoadingAuth] = useState(false);
   const [loadingData, setLoadingData] = useState(true);
 
@@ -205,7 +214,7 @@ export default function ParentHomeScreen() {
   const [profileLoading, setProfileLoading] = useState(false);
   const [profileSaveSuccess, setProfileSaveSuccess] = useState(false);
 
-  // NUEVO: ESTADOS DEL GATEKEEPER JUST-IN-TIME (ÍTEM #22 FASE 1)
+  // ESTADOS DEL GATEKEEPER JUST-IN-TIME (ÍTEM #22 FASE 1)
   const [showOnboardingGateModal, setShowOnboardingGateModal] = useState(false);
   const [pendingSitterIdForGate, setPendingSitterIdForGate] = useState<
     string | null
@@ -215,6 +224,36 @@ export default function ParentHomeScreen() {
   const toggleBreakdown = (id: string) => {
     setExpandedBreakdownIds((prev) => ({ ...prev, [id]: !prev[id] }));
   };
+
+  // NUEVO: ATERRIZAJE INTELIGENTE POR ?requestId=<ID> (ÍTEM #20 FASE 2)
+  useEffect(() => {
+    if (!paramRequestId) return;
+    const targetId = String(paramRequestId);
+
+    const foundInHistory = historyRequests.find(
+      (item) => String(item.id) === targetId,
+    );
+    const foundInActive = Object.values(myRequests).find(
+      (req: any) => String(req.id) === targetId,
+    );
+
+    if (!foundInHistory && !foundInActive) return;
+
+    setActiveTab(foundInHistory ? "history" : "nannies");
+    setHighlightedRequestId(targetId);
+
+    const scrollTimer = setTimeout(() => {
+      const targetY = cardPositionsRef.current[targetId];
+      if (typeof targetY === "number" && mainScrollRef.current) {
+        mainScrollRef.current.scrollTo({
+          y: Math.max(0, targetY - 24),
+          animated: true,
+        });
+      }
+    }, 450);
+
+    return () => clearTimeout(scrollTimer);
+  }, [paramRequestId, myRequests, historyRequests, babysitters]);
 
   useEffect(() => {
     let reqSubscription: any = null;
@@ -299,7 +338,6 @@ export default function ParentHomeScreen() {
           (payload) => {
             const incoming = payload.new;
             setMessages((prev) => {
-              // Evitar duplicados si ya se insertó por Optimistic UI
               const exists = prev.some(
                 (m) =>
                   m.id === incoming.id ||
@@ -322,7 +360,6 @@ export default function ParentHomeScreen() {
         )
         .subscribe();
 
-      // Polling silencioso de respaldo cada 4s por si la red móvil corta el WebSocket
       pollInterval = setInterval(() => {
         loadMessages(activeRequestId, true);
       }, 4000);
@@ -379,7 +416,6 @@ export default function ParentHomeScreen() {
       } = await supabase.auth.getUser();
       if (!user) return;
 
-      // 1. OPTIMISTIC UI: Mostrar el mensaje en pantalla en 0 ms
       const tempId = "temp_" + Date.now();
       const optimisticMsg = {
         id: tempId,
@@ -393,7 +429,6 @@ export default function ParentHomeScreen() {
       setMessages((prev) => [...prev, optimisticMsg]);
       setNewMessage("");
 
-      // 2. Insertar en Supabase y recuperar la fila real
       const { data: insertedRows, error } = await supabase
         .from("messages")
         .insert([
@@ -407,7 +442,6 @@ export default function ParentHomeScreen() {
         .select();
 
       if (error) {
-        // Si falló, revertimos la burbuja temporal y devolvemos el texto
         setMessages((prev) => prev.filter((m) => m.id !== tempId));
         setNewMessage(textToSend);
         throw error;
@@ -537,8 +571,6 @@ export default function ParentHomeScreen() {
       const { data, error } = await query;
       if (error) throw error;
 
-      // GATEKEEPER DE VISIBILIDAD: Filtramos perfiles que tengan tarifa >= 10000 y nombre
-      // (Y si ya tienen solicitudes activas o teléfono configurado, se muestran)
       const validSitters = (data || []).filter((s) => {
         const hasMinRate = Number(s.hourly_rate) >= 10000;
         const hasName = Boolean(s.first_name && s.first_name.trim());
@@ -632,7 +664,6 @@ export default function ParentHomeScreen() {
     setShowModalPriceBreakdown(false);
   };
 
-  // NUEVO: VALIDACIÓN GATEKEEPER ANTES DE ENVIAR LA SOLICITUD (ÍTEM #22 FASE 1)
   const handleInitiateRequestBabysitter = (babysitterId: string) => {
     const startMins = timeToMinutes(selectedGlobalStartTime);
     const endMins = timeToMinutes(selectedGlobalEndTime);
@@ -662,7 +693,6 @@ export default function ParentHomeScreen() {
     confirmRequestBabysitter(babysitterId);
   };
 
-  // GUARDAR DATOS MÍNIMOS EN EL MODAL GATEKEEPER Y DISPARAR LA SOLICITUD DE INMEDIATO
   const handleSaveGateAndSubmitRequest = async () => {
     const cleanDigits = (parentProfile.phone || "").replace(/\D/g, "");
     if (cleanDigits.length < 8) {
@@ -1080,6 +1110,7 @@ export default function ParentHomeScreen() {
   return (
     <View style={styles.mainWrapper}>
       <ScrollView
+        ref={mainScrollRef}
         style={{ flex: 1 }}
         contentContainerStyle={styles.container}
         stickyHeaderIndices={[2]}
@@ -1305,6 +1336,9 @@ export default function ParentHomeScreen() {
                 {babysitters.map((sitter) => {
                   const reqData = myRequests[sitter.id];
                   const requestStatus = reqData?.status;
+                  const isHighlighted = Boolean(
+                    reqData?.id && highlightedRequestId === String(reqData.id),
+                  );
                   const rawPhone =
                     sitter.phone_number ||
                     sitter.phone ||
@@ -1332,7 +1366,32 @@ export default function ParentHomeScreen() {
                   );
 
                   return (
-                    <View key={sitter.id} style={styles.card}>
+                    <View
+                      key={sitter.id}
+                      onLayout={(e) => {
+                        if (reqData?.id) {
+                          cardPositionsRef.current[String(reqData.id)] =
+                            e.nativeEvent.layout.y;
+                        }
+                      }}
+                      style={[
+                        styles.card,
+                        isHighlighted && styles.cardHighlighted,
+                      ]}
+                    >
+                      {isHighlighted && (
+                        <View style={styles.highlightBanner}>
+                          <Text style={styles.highlightBannerText}>
+                            ✨ Turno seleccionado desde tu correo
+                          </Text>
+                          <TouchableOpacity
+                            onPress={() => setHighlightedRequestId(null)}
+                          >
+                            <Text style={styles.highlightDismissText}>✕</Text>
+                          </TouchableOpacity>
+                        </View>
+                      )}
+
                       <TouchableOpacity
                         activeOpacity={0.7}
                         onPress={() => handleOpenSitterModal(sitter)}
@@ -1664,6 +1723,8 @@ export default function ParentHomeScreen() {
             ) : (
               <View style={styles.listContainer}>
                 {historyRequests.map((item) => {
+                  const isHighlighted =
+                    highlightedRequestId === String(item.id);
                   const sitter = item.babysitter_profiles || {};
                   const isCompleted = item.status === "completed";
                   const isRejected = item.status === "rejected";
@@ -1684,7 +1745,30 @@ export default function ParentHomeScreen() {
                   const payBadge = getPaymentStatusBadge(item.payment_status);
 
                   return (
-                    <View key={item.id} style={styles.card}>
+                    <View
+                      key={item.id}
+                      onLayout={(e) => {
+                        cardPositionsRef.current[String(item.id)] =
+                          e.nativeEvent.layout.y;
+                      }}
+                      style={[
+                        styles.card,
+                        isHighlighted && styles.cardHighlighted,
+                      ]}
+                    >
+                      {isHighlighted && (
+                        <View style={styles.highlightBanner}>
+                          <Text style={styles.highlightBannerText}>
+                            ✨ Turno seleccionado desde tu correo
+                          </Text>
+                          <TouchableOpacity
+                            onPress={() => setHighlightedRequestId(null)}
+                          >
+                            <Text style={styles.highlightDismissText}>✕</Text>
+                          </TouchableOpacity>
+                        </View>
+                      )}
+
                       <View style={styles.cardHeaderRow}>
                         <View style={{ flex: 1 }}>
                           <Text style={styles.cardName}>
@@ -2091,7 +2175,7 @@ export default function ParentHomeScreen() {
         </Modal>
       )}
 
-      {/* NUEVO: MODAL GATEKEEPER JUST-IN-TIME DE DATOS MÍNIMOS (ÍTEM #22 FASE 1) */}
+      {/* MODAL GATEKEEPER JUST-IN-TIME DE DATOS MÍNIMOS (ÍTEM #22 FASE 1) */}
       {showOnboardingGateModal && (
         <Modal
           visible={showOnboardingGateModal}
@@ -2323,7 +2407,11 @@ export default function ParentHomeScreen() {
                         styles.notificationCard,
                         !notif.is_read && styles.notificationUnread,
                       ]}
-                      onPress={() => markNotificationAsRead(notif.id)}
+                      onPress={async () => {
+                        await markNotificationAsRead(notif.id);
+                        setShowNotifications(false);
+                        setActiveTab("nannies");
+                      }}
                     >
                       <View style={styles.notificationHeaderRow}>
                         <Text style={styles.notificationTitle}>
@@ -2335,7 +2423,8 @@ export default function ParentHomeScreen() {
                         {notif.message}
                       </Text>
                       <Text style={styles.notificationDate}>
-                        {new Date(notif.created_at).toLocaleString()}
+                        {new Date(notif.created_at).toLocaleString()} (Toca para
+                        ver)
                       </Text>
                     </TouchableOpacity>
                   ))
@@ -2549,6 +2638,34 @@ const styles = StyleSheet.create({
     marginBottom: 16,
     borderWidth: 1,
     borderColor: "#e2e8f0",
+  },
+  cardHighlighted: {
+    borderColor: "#d69e2e",
+    borderWidth: 2.5,
+    backgroundColor: "#fffff0",
+  },
+  highlightBanner: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    backgroundColor: "#fefcbf",
+    borderWidth: 1,
+    borderColor: "#f6e05e",
+    borderRadius: 8,
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    marginBottom: 12,
+  },
+  highlightBannerText: {
+    fontSize: 12,
+    fontWeight: "bold",
+    color: "#975a16",
+  },
+  highlightDismissText: {
+    fontSize: 14,
+    fontWeight: "bold",
+    color: "#975a16",
+    paddingHorizontal: 4,
   },
   cardHeaderRow: {
     flexDirection: "row",
