@@ -1,5 +1,5 @@
 import { supabase } from "@/utils/supabase";
-import { useRouter } from "expo-router";
+import { useLocalSearchParams, useRouter } from "expo-router";
 import { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
@@ -97,11 +97,20 @@ const getHoursFromTimeRange = (jobTime?: string) => {
 
 export default function BabysitterHomeScreen() {
   const router = useRouter();
+  const { requestId: paramRequestId } = useLocalSearchParams<{
+    requestId?: string;
+  }>();
+
+  const mainScrollRef = useRef<ScrollView | null>(null);
+  const cardPositionsRef = useRef<{ [key: string]: number }>({});
   const chatScrollRef = useRef<ScrollView | null>(null);
 
   const [activeTab, setActiveTab] = useState<
     "requests" | "history" | "profile"
   >("requests");
+  const [highlightedRequestId, setHighlightedRequestId] = useState<
+    string | null
+  >(null);
   const [loadingRequests, setLoadingRequests] = useState(true);
   const [requests, setRequests] = useState<any[]>([]);
   const [updatingId, setUpdatingId] = useState<string | null>(null);
@@ -141,6 +150,36 @@ export default function BabysitterHomeScreen() {
   const toggleBreakdown = (id: string) => {
     setExpandedBreakdownIds((prev) => ({ ...prev, [id]: !prev[id] }));
   };
+
+  // NUEVO: ATERRIZAJE INTELIGENTE POR ?requestId=<ID> (ÍTEM #20 FASE 2)
+  useEffect(() => {
+    if (!paramRequestId || loadingRequests || requests.length === 0) return;
+
+    const targetId = String(paramRequestId);
+    const found = requests.find((r) => String(r.id) === targetId);
+    if (!found) return;
+
+    const s = String(found.status || "")
+      .toLowerCase()
+      .trim();
+    const isHistory =
+      s === "completed" || s === "rejected" || s === "dismissed";
+
+    setActiveTab(isHistory ? "history" : "requests");
+    setHighlightedRequestId(targetId);
+
+    const scrollTimer = setTimeout(() => {
+      const targetY = cardPositionsRef.current[targetId];
+      if (typeof targetY === "number" && mainScrollRef.current) {
+        mainScrollRef.current.scrollTo({
+          y: Math.max(0, targetY - 24),
+          animated: true,
+        });
+      }
+    }, 400);
+
+    return () => clearTimeout(scrollTimer);
+  }, [paramRequestId, loadingRequests, requests]);
 
   useEffect(() => {
     let reqSubscription: any = null;
@@ -801,7 +840,11 @@ export default function BabysitterHomeScreen() {
 
   return (
     <View style={styles.mainWrapper}>
-      <ScrollView style={{ flex: 1 }} contentContainerStyle={styles.container}>
+      <ScrollView
+        ref={mainScrollRef}
+        style={{ flex: 1 }}
+        contentContainerStyle={styles.container}
+      >
         <View style={styles.headerContainer}>
           <View style={{ flex: 1 }}>
             <Text style={styles.title}>Panel de Niñera 👩‍🍼</Text>
@@ -919,6 +962,7 @@ export default function BabysitterHomeScreen() {
               <View style={styles.listContainer}>
                 {activeRequests.map((req) => {
                   const isUpdatingThis = updatingId === req.id;
+                  const isHighlighted = highlightedRequestId === String(req.id);
                   const statusNormalized = String(req.status || "")
                     .toLowerCase()
                     .trim();
@@ -939,7 +983,30 @@ export default function BabysitterHomeScreen() {
                   const payBadge = getPaymentStatusBadge(req.payment_status);
 
                   return (
-                    <View key={req.id} style={styles.card}>
+                    <View
+                      key={req.id}
+                      onLayout={(e) => {
+                        cardPositionsRef.current[String(req.id)] =
+                          e.nativeEvent.layout.y;
+                      }}
+                      style={[
+                        styles.card,
+                        isHighlighted && styles.cardHighlighted,
+                      ]}
+                    >
+                      {isHighlighted && (
+                        <View style={styles.highlightBanner}>
+                          <Text style={styles.highlightBannerText}>
+                            ✨ Turno seleccionado desde tu correo
+                          </Text>
+                          <TouchableOpacity
+                            onPress={() => setHighlightedRequestId(null)}
+                          >
+                            <Text style={styles.highlightDismissText}>✕</Text>
+                          </TouchableOpacity>
+                        </View>
+                      )}
+
                       <View style={styles.cardHeader}>
                         <View style={{ flex: 1 }}>
                           <Text style={styles.requestId}>
@@ -1262,6 +1329,7 @@ export default function BabysitterHomeScreen() {
             ) : (
               <View style={styles.listContainer}>
                 {historyRequests.map((req) => {
+                  const isHighlighted = highlightedRequestId === String(req.id);
                   const statusNormalized = String(req.status || "")
                     .toLowerCase()
                     .trim();
@@ -1285,7 +1353,30 @@ export default function BabysitterHomeScreen() {
                   const payBadge = getPaymentStatusBadge(req.payment_status);
 
                   return (
-                    <View key={req.id} style={styles.card}>
+                    <View
+                      key={req.id}
+                      onLayout={(e) => {
+                        cardPositionsRef.current[String(req.id)] =
+                          e.nativeEvent.layout.y;
+                      }}
+                      style={[
+                        styles.card,
+                        isHighlighted && styles.cardHighlighted,
+                      ]}
+                    >
+                      {isHighlighted && (
+                        <View style={styles.highlightBanner}>
+                          <Text style={styles.highlightBannerText}>
+                            ✨ Turno seleccionado desde tu correo
+                          </Text>
+                          <TouchableOpacity
+                            onPress={() => setHighlightedRequestId(null)}
+                          >
+                            <Text style={styles.highlightDismissText}>✕</Text>
+                          </TouchableOpacity>
+                        </View>
+                      )}
+
                       <View style={styles.cardHeader}>
                         <View style={{ flex: 1 }}>
                           <Text style={styles.requestId}>
@@ -1926,6 +2017,34 @@ const styles = StyleSheet.create({
     marginBottom: 16,
     borderWidth: 1,
     borderColor: "#e2e8f0",
+  },
+  cardHighlighted: {
+    borderColor: "#d69e2e",
+    borderWidth: 2.5,
+    backgroundColor: "#fffff0",
+  },
+  highlightBanner: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    backgroundColor: "#fefcbf",
+    borderWidth: 1,
+    borderColor: "#f6e05e",
+    borderRadius: 8,
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    marginBottom: 12,
+  },
+  highlightBannerText: {
+    fontSize: 12,
+    fontWeight: "bold",
+    color: "#975a16",
+  },
+  highlightDismissText: {
+    fontSize: 14,
+    fontWeight: "bold",
+    color: "#975a16",
+    paddingHorizontal: 4,
   },
   cardHeader: {
     flexDirection: "row",
