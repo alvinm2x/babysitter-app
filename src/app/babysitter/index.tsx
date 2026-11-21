@@ -211,6 +211,18 @@ export default function BabysitterHomeScreen() {
   const cardPositionsRef = useRef<{ [key: string]: number }>({});
   const chatScrollRef = useRef<ScrollView | null>(null);
 
+  // Refs para Chat 2.0 (badges en vivo + typing broadcast)
+  const currentUserIdRef = useRef<string | null>(null);
+  const activeRequestIdsRef = useRef<string[]>([]);
+  const isChatOpenRef = useRef<boolean>(false);
+  const activeRequestIdRef = useRef<string | null>(null);
+  const typingChannelRef = useRef<any>(null);
+  const lastTypingEmitRef = useRef<number>(0);
+  const typingStopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const typingClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+
   const [activeTab, setActiveTab] = useState<
     "requests" | "history" | "profile"
   >("requests");
@@ -253,8 +265,196 @@ export default function BabysitterHomeScreen() {
   const [newMessage, setNewMessage] = useState("");
   const [sendingMessage, setSendingMessage] = useState(false);
 
+  // NUEVO: ESTADOS CHAT 2.0 FASE 2 (#24)
+  const [unreadMap, setUnreadMap] = useState<{
+    [reqId: string]: { count: number; hasSupport: boolean };
+  }>({});
+  const [counterpartLastReadAt, setCounterpartLastReadAt] = useState<
+    string | null
+  >(null);
+  const [typingIndicatorText, setTypingIndicatorText] = useState<string | null>(
+    null,
+  );
+
   const toggleBreakdown = (id: string) => {
     setExpandedBreakdownIds((prev) => ({ ...prev, [id]: !prev[id] }));
+  };
+
+  useEffect(() => {
+    isChatOpenRef.current = isChatOpen;
+    activeRequestIdRef.current = activeRequestId;
+  }, [isChatOpen, activeRequestId]);
+
+  const loadUnreadStats = async (reqIds: string[], explicitUserId?: string) => {
+    if (!reqIds || reqIds.length === 0) {
+      setUnreadMap({});
+      return;
+    }
+    try {
+      let uid = explicitUserId || currentUserIdRef.current;
+      if (!uid) {
+        const {
+          data: { user },
+        } = await supabase.auth.getUser();
+        uid = user?.id || null;
+        currentUserIdRef.current = uid;
+      }
+      if (!uid) return;
+
+      const [receiptsRes, msgsRes] = await Promise.all([
+        supabase
+          .from("chat_read_receipts")
+          .select("request_id, last_read_at")
+          .in("request_id", reqIds)
+          .eq("user_id", uid)
+          .eq("reader_role", "babysitter"),
+        supabase
+          .from("messages")
+          .select("id, request_id, sender_id, content, created_at")
+          .in("request_id", reqIds),
+      ]);
+
+      const readMap: { [reqId: string]: number } = {};
+      receiptsRes.data?.forEach((r: any) => {
+        const ts = new Date(r.last_read_at).getTime();
+        if (!isNaN(ts)) readMap[String(r.request_id)] = ts;
+      });
+
+      const nextUnread: {
+        [reqId: string]: { count: number; hasSupport: boolean };
+      } = {};
+
+      msgsRes.data?.forEach((m: any) => {
+        const rId = String(m.request_id);
+        const isSupport = Boolean(m.content?.startsWith("[Soporte"));
+        const isFromMe = m.sender_id === uid && !isSupport;
+        if (isFromMe) return;
+
+        const msgTs = new Date(m.created_at).getTime();
+        const lastReadTs = readMap[rId] || 0;
+        if (msgTs > lastReadTs) {
+          if (!nextUnread[rId]) {
+            nextUnread[rId] = { count: 0, hasSupport: false };
+          }
+          nextUnread[rId].count += 1;
+          if (isSupport) nextUnread[rId].hasSupport = true;
+        }
+      });
+
+      setUnreadMap(nextUnread);
+    } catch (err) {
+      console.error("Error cargando no leídos (babysitter):", err);
+    }
+  };
+
+  const markChatAsRead = async (reqId: string) => {
+    if (!reqId) return;
+    setUnreadMap((prev) => ({
+      ...prev,
+      [String(reqId)]: { count: 0, hasSupport: false },
+    }));
+
+    try {
+      let uid = currentUserIdRef.current;
+      if (!uid) {
+        const {
+          data: { user },
+        } = await supabase.auth.getUser();
+        uid = user?.id || null;
+        currentUserIdRef.current = uid;
+      }
+      if (!uid) return;
+
+      const nowIso = new Date().toISOString();
+      await supabase.from("chat_read_receipts").upsert(
+        {
+          request_id: reqId,
+          user_id: uid,
+          reader_role: "babysitter",
+          last_read_at: nowIso,
+          updated_at: nowIso,
+        },
+        { onConflict: "request_id,user_id,reader_role" },
+      );
+    } catch (err) {
+      console.error("Error marcando chat como leído (babysitter):", err);
+    }
+  };
+
+  const loadCounterpartReadReceipt = async (reqId: string) => {
+    try {
+      const { data, error } = await supabase
+        .from("chat_read_receipts")
+        .select("last_read_at")
+        .eq("request_id", reqId)
+        .eq("reader_role", "parent")
+        .order("last_read_at", { ascending: false })
+        .limit(1);
+
+      if (!error && data && data[0]?.last_read_at) {
+        setCounterpartLastReadAt(data[0].last_read_at);
+      } else if (!error) {
+        setCounterpartLastReadAt(null);
+      }
+    } catch (err) {
+      console.error("Error leyendo recibo de familia:", err);
+    }
+  };
+
+  const emitTypingEvent = (isTyping: boolean) => {
+    const channel = typingChannelRef.current;
+    if (!channel) return;
+    try {
+      channel.send({
+        type: "broadcast",
+        event: "typing",
+        payload: {
+          role: "babysitter",
+          name: firstName || "La niñera",
+          isTyping,
+        },
+      });
+    } catch {}
+  };
+
+  const handleChatTextChange = (text: string) => {
+    setNewMessage(text);
+    if (!isChatOpen || !activeRequestId) return;
+
+    if (!text.trim()) {
+      if (typingStopTimerRef.current) clearTimeout(typingStopTimerRef.current);
+      emitTypingEvent(false);
+      return;
+    }
+
+    const now = Date.now();
+    if (now - lastTypingEmitRef.current > 1500) {
+      lastTypingEmitRef.current = now;
+      emitTypingEvent(true);
+    }
+
+    if (typingStopTimerRef.current) clearTimeout(typingStopTimerRef.current);
+    typingStopTimerRef.current = setTimeout(() => {
+      emitTypingEvent(false);
+    }, 2500);
+  };
+
+  const openChatForRequest = (
+    req: any,
+    parentDisplayName: string,
+    parentInfo: any,
+  ) => {
+    if (!req?.id) return;
+    setActiveChatParent({
+      id: req.parent_id,
+      parent_name: parentDisplayName,
+      ...parentInfo,
+    });
+    setActiveRequestId(req.id);
+    setCounterpartLastReadAt(null);
+    setTypingIndicatorText(null);
+    setIsChatOpen(true);
+    markChatAsRead(req.id);
   };
 
   // ATERRIZAJE INTELIGENTE POR ?requestId=<ID> (ÍTEM #20 FASE 2)
@@ -290,21 +490,24 @@ export default function BabysitterHomeScreen() {
   useEffect(() => {
     let reqSubscription: any = null;
     let notifSubscription: any = null;
+    let bgMsgSubscription: any = null;
 
     const initDataAndRealtime = async () => {
-      await fetchRequests();
-      await loadProfile();
-      await loadNotifications();
-
       const {
         data: { user },
       } = await supabase.auth.getUser();
+      if (user) currentUserIdRef.current = user.id;
+
+      await fetchRequests();
+      await loadProfile();
+      await loadNotifications();
 
       if (user) {
         supabase.removeChannel(
           supabase.channel("babysitter_realtime_requests"),
         );
         supabase.removeChannel(supabase.channel("babysitter_realtime_notifs"));
+        supabase.removeChannel(supabase.channel("babysitter_realtime_bg_msgs"));
 
         reqSubscription = supabase
           .channel("babysitter_realtime_requests")
@@ -337,6 +540,47 @@ export default function BabysitterHomeScreen() {
             },
           )
           .subscribe();
+
+        // ESCUCHA EN SEGUNDO PLANO DE MENSAJES PARA BADGES EN VIVO (#24 FASE 2)
+        bgMsgSubscription = supabase
+          .channel("babysitter_realtime_bg_msgs")
+          .on(
+            "postgres_changes",
+            {
+              event: "INSERT",
+              schema: "public",
+              table: "messages",
+            },
+            (payload) => {
+              const incoming: any = payload.new;
+              const rId = String(incoming?.request_id || "");
+              if (!activeRequestIdsRef.current.includes(rId)) return;
+
+              const isSupport = Boolean(
+                incoming?.content?.startsWith("[Soporte"),
+              );
+              const isFromMe =
+                incoming?.sender_id === currentUserIdRef.current && !isSupport;
+              if (isFromMe) return;
+
+              if (isChatOpenRef.current && activeRequestIdRef.current === rId) {
+                markChatAsRead(rId);
+                return;
+              }
+
+              setUnreadMap((prev) => {
+                const curr = prev[rId] || { count: 0, hasSupport: false };
+                return {
+                  ...prev,
+                  [rId]: {
+                    count: curr.count + 1,
+                    hasSupport: curr.hasSupport || isSupport,
+                  },
+                };
+              });
+            },
+          )
+          .subscribe();
       }
     };
 
@@ -345,18 +589,29 @@ export default function BabysitterHomeScreen() {
     return () => {
       if (reqSubscription) supabase.removeChannel(reqSubscription);
       if (notifSubscription) supabase.removeChannel(notifSubscription);
+      if (bgMsgSubscription) supabase.removeChannel(bgMsgSubscription);
     };
   }, []);
 
-  // MOTOR CHAT REALTIME 2.0 + FALLBACK POLLING CADA 4 SEGUNDOS
+  // MOTOR CHAT REALTIME 2.0 + RECIBOS ✓✓ + BROADCAST "ESCRIBIENDO..." + POLLING 4S
   useEffect(() => {
     let chatSub: any = null;
+    let receiptSub: any = null;
+    let typingSub: any = null;
     let pollInterval: any = null;
 
     if (isChatOpen && activeRequestId) {
       loadMessages(activeRequestId);
+      loadCounterpartReadReceipt(activeRequestId);
+      markChatAsRead(activeRequestId);
+
       const channelName = "sitter_chat_" + activeRequestId;
+      const receiptChannelName = "sitter_receipts_" + activeRequestId;
+      const typingChannelName = "chat_room_typing_" + activeRequestId;
+
       supabase.removeChannel(supabase.channel(channelName));
+      supabase.removeChannel(supabase.channel(receiptChannelName));
+      supabase.removeChannel(supabase.channel(typingChannelName));
 
       chatSub = supabase
         .channel(channelName)
@@ -389,17 +644,78 @@ export default function BabysitterHomeScreen() {
               }
               return [...prev, incoming];
             });
+            markChatAsRead(activeRequestId);
           },
         )
         .subscribe();
 
+      receiptSub = supabase
+        .channel(receiptChannelName)
+        .on(
+          "postgres_changes",
+          {
+            event: "*",
+            schema: "public",
+            table: "chat_read_receipts",
+            filter: "request_id=eq." + activeRequestId,
+          },
+          (payload) => {
+            const row: any = payload.new;
+            if (row?.reader_role === "parent" && row?.last_read_at) {
+              setCounterpartLastReadAt(row.last_read_at);
+            }
+          },
+        )
+        .subscribe();
+
+      typingSub = supabase
+        .channel(typingChannelName, {
+          config: { broadcast: { self: false } },
+        })
+        .on("broadcast", { event: "typing" }, ({ payload }) => {
+          if (!payload || payload.role === "babysitter") return;
+
+          if (typingClearTimerRef.current) {
+            clearTimeout(typingClearTimerRef.current);
+          }
+
+          if (!payload.isTyping) {
+            setTypingIndicatorText(null);
+            return;
+          }
+
+          const label =
+            payload.role === "admin"
+              ? "🛡️ Soporte MiBabysitter está escribiendo..."
+              : `${activeChatParent?.parent_name || payload.name || "La familia"} está escribiendo...`;
+          setTypingIndicatorText(label);
+
+          typingClearTimerRef.current = setTimeout(() => {
+            setTypingIndicatorText(null);
+          }, 3200);
+        })
+        .subscribe();
+
+      typingChannelRef.current = typingSub;
+
       pollInterval = setInterval(() => {
         loadMessages(activeRequestId, true);
+        loadCounterpartReadReceipt(activeRequestId);
       }, 4000);
     }
 
     return () => {
+      if (typingStopTimerRef.current) clearTimeout(typingStopTimerRef.current);
+      if (typingClearTimerRef.current)
+        clearTimeout(typingClearTimerRef.current);
+      if (typingChannelRef.current) {
+        emitTypingEvent(false);
+        typingChannelRef.current = null;
+      }
+      setTypingIndicatorText(null);
       if (chatSub) supabase.removeChannel(chatSub);
+      if (receiptSub) supabase.removeChannel(receiptSub);
+      if (typingSub) supabase.removeChannel(typingSub);
       if (pollInterval) clearInterval(pollInterval);
     };
   }, [isChatOpen, activeRequestId]);
@@ -432,6 +748,9 @@ export default function BabysitterHomeScreen() {
     const textToSend = newMessage.trim();
     if (!textToSend || !activeRequestId || !activeChatParent || sendingMessage)
       return;
+
+    if (typingStopTimerRef.current) clearTimeout(typingStopTimerRef.current);
+    emitTypingEvent(false);
 
     setSendingMessage(true);
     try {
@@ -481,6 +800,8 @@ export default function BabysitterHomeScreen() {
           return prev.map((m) => (m.id === tempId ? realMsg : m));
         });
       }
+
+      markChatAsRead(activeRequestId);
 
       await sendNotificationToParent(
         activeChatParent.id,
@@ -564,6 +885,7 @@ export default function BabysitterHomeScreen() {
         data: { user },
       } = await supabase.auth.getUser();
       if (!user) return;
+      currentUserIdRef.current = user.id;
 
       const { data: reqs, error: reqError } = await supabase
         .from("job_requests")
@@ -572,6 +894,8 @@ export default function BabysitterHomeScreen() {
         .order("created_at", { ascending: false });
       if (reqError) throw reqError;
       if (!reqs || reqs.length === 0) {
+        activeRequestIdsRef.current = [];
+        setUnreadMap({});
         setRequests([]);
         setLoadingRequests(false);
         return;
@@ -614,7 +938,19 @@ export default function BabysitterHomeScreen() {
           parent_name: nameMap[r.parent_id] || "Familia",
         },
       }));
+
+      const activeIds = combined
+        .filter((r) => {
+          const s = String(r.status || "")
+            .toLowerCase()
+            .trim();
+          return s !== "completed" && s !== "rejected" && s !== "dismissed";
+        })
+        .map((r) => String(r.id));
+
+      activeRequestIdsRef.current = activeIds;
       setRequests(combined);
+      loadUnreadStats(activeIds, user.id);
     } catch (error: any) {
       console.error("Error al obtener solicitudes:", error.message);
     } finally {
@@ -1069,6 +1405,10 @@ export default function BabysitterHomeScreen() {
                 {activeRequests.map((req) => {
                   const isUpdatingThis = updatingId === req.id;
                   const isHighlighted = highlightedRequestId === String(req.id);
+                  const unreadInfo = unreadMap[String(req.id)] || {
+                    count: 0,
+                    hasSupport: false,
+                  };
                   const statusNormalized = String(req.status || "")
                     .toLowerCase()
                     .trim();
@@ -1325,19 +1665,33 @@ export default function BabysitterHomeScreen() {
 
                           <TouchableOpacity
                             style={styles.chatAppButton}
-                            onPress={() => {
-                              setActiveChatParent({
-                                id: req.parent_id,
-                                parent_name: parentDisplayName,
-                                ...parentInfo,
-                              });
-                              setActiveRequestId(req.id);
-                              setIsChatOpen(true);
-                            }}
+                            onPress={() =>
+                              openChatForRequest(
+                                req,
+                                parentDisplayName,
+                                parentInfo,
+                              )
+                            }
                           >
-                            <Text style={styles.chatAppButtonText}>
-                              💬 Chat con {parentDisplayName}
-                            </Text>
+                            <View style={styles.chatBtnContentRow}>
+                              <Text style={styles.chatAppButtonText}>
+                                💬 Chat con {parentDisplayName}
+                              </Text>
+                              {unreadInfo.count > 0 && (
+                                <View style={styles.chatUnreadPill}>
+                                  <Text style={styles.chatUnreadPillText}>
+                                    {unreadInfo.count}
+                                  </Text>
+                                </View>
+                              )}
+                              {unreadInfo.hasSupport && (
+                                <View style={styles.chatSupportAlertPill}>
+                                  <Text style={styles.chatSupportAlertText}>
+                                    🛡️ Soporte
+                                  </Text>
+                                </View>
+                              )}
+                            </View>
                           </TouchableOpacity>
 
                           <TouchableOpacity
@@ -1375,6 +1729,40 @@ export default function BabysitterHomeScreen() {
                               </TouchableOpacity>
                             )}
                         </View>
+                      )}
+
+                      {!isAccepted && unreadInfo.count > 0 && (
+                        <TouchableOpacity
+                          style={[
+                            styles.chatAppButton,
+                            { marginTop: 4, marginBottom: 10 },
+                          ]}
+                          onPress={() =>
+                            openChatForRequest(
+                              req,
+                              parentDisplayName,
+                              parentInfo,
+                            )
+                          }
+                        >
+                          <View style={styles.chatBtnContentRow}>
+                            <Text style={styles.chatAppButtonText}>
+                              💬 Ver mensajes del turno
+                            </Text>
+                            <View style={styles.chatUnreadPill}>
+                              <Text style={styles.chatUnreadPillText}>
+                                {unreadInfo.count}
+                              </Text>
+                            </View>
+                            {unreadInfo.hasSupport && (
+                              <View style={styles.chatSupportAlertPill}>
+                                <Text style={styles.chatSupportAlertText}>
+                                  🛡️ Soporte
+                                </Text>
+                              </View>
+                            )}
+                          </View>
+                        </TouchableOpacity>
                       )}
 
                       <Text style={styles.dateText}>
@@ -2020,6 +2408,13 @@ export default function BabysitterHomeScreen() {
                     }
 
                     const isMe = msg.sender_id !== activeChatParent?.id;
+                    const isReadByCounterpart =
+                      isMe &&
+                      !msg._optimistic &&
+                      Boolean(counterpartLastReadAt) &&
+                      new Date(counterpartLastReadAt as string).getTime() >=
+                        new Date(msg.created_at).getTime() - 1000;
+
                     return (
                       <View
                         key={msg.id || idx}
@@ -2039,25 +2434,52 @@ export default function BabysitterHomeScreen() {
                         >
                           {msg.content}
                         </Text>
-                        {Boolean(timeStr) && (
-                          <Text
-                            style={isMe ? styles.msgTimeMe : styles.msgTimeThem}
-                          >
-                            {timeStr}
-                          </Text>
-                        )}
+                        <View style={styles.msgMetaRow}>
+                          {Boolean(timeStr) && (
+                            <Text
+                              style={
+                                isMe ? styles.msgTimeMe : styles.msgTimeThem
+                              }
+                            >
+                              {timeStr}
+                            </Text>
+                          )}
+                          {isMe && (
+                            <Text
+                              style={
+                                isReadByCounterpart
+                                  ? styles.msgCheckRead
+                                  : styles.msgCheckSent
+                              }
+                            >
+                              {msg._optimistic
+                                ? "🕒"
+                                : isReadByCounterpart
+                                  ? "✓✓"
+                                  : "✓"}
+                            </Text>
+                          )}
+                        </View>
                       </View>
                     );
                   })
                 )}
               </ScrollView>
 
+              {Boolean(typingIndicatorText) && (
+                <View style={styles.typingIndicatorBar}>
+                  <Text style={styles.typingIndicatorText}>
+                    ✍️ {typingIndicatorText}
+                  </Text>
+                </View>
+              )}
+
               <View style={styles.chatInputRow}>
                 <TextInput
                   style={styles.chatInput}
                   placeholder="Escribe un mensaje..."
                   value={newMessage}
-                  onChangeText={setNewMessage}
+                  onChangeText={handleChatTextChange}
                   onSubmitEditing={sendMessage}
                   returnKeyType="send"
                 />
@@ -2448,6 +2870,40 @@ const styles = StyleSheet.create({
     marginTop: 8,
     width: "100%",
   },
+  chatBtnContentRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+    flexWrap: "wrap",
+  },
+  chatUnreadPill: {
+    backgroundColor: "#e53e3e",
+    borderRadius: 10,
+    minWidth: 20,
+    height: 20,
+    paddingHorizontal: 6,
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  chatUnreadPillText: {
+    color: "#ffffff",
+    fontSize: 11,
+    fontWeight: "bold",
+  },
+  chatSupportAlertPill: {
+    backgroundColor: "#fefcbf",
+    borderRadius: 10,
+    paddingHorizontal: 7,
+    paddingVertical: 2,
+    borderWidth: 1,
+    borderColor: "#d69e2e",
+  },
+  chatSupportAlertText: {
+    color: "#975a16",
+    fontSize: 11,
+    fontWeight: "bold",
+  },
   chatAppButtonText: { color: "#ffffff", fontWeight: "bold", fontSize: 14 },
 
   calendarButton: {
@@ -2734,21 +3190,47 @@ const styles = StyleSheet.create({
   messageText: { fontSize: 15 },
   messageTextMe: { color: "#ffffff" },
   messageTextThem: { color: "#2d3748" },
+  msgMetaRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "flex-end",
+    gap: 4,
+    marginTop: 4,
+  },
   msgTimeMe: {
     fontSize: 10,
     color: "#e9d8fd",
-    marginTop: 4,
-    alignSelf: "flex-end",
   },
   msgTimeThem: {
     fontSize: 10,
     color: "#718096",
-    marginTop: 4,
-    alignSelf: "flex-end",
   },
   msgTimeSupport: {
     fontSize: 10,
     color: "#975a16",
+  },
+  msgCheckSent: {
+    fontSize: 11,
+    color: "#e9d8fd",
+    fontWeight: "bold",
+  },
+  msgCheckRead: {
+    fontSize: 11,
+    color: "#90cdf4",
+    fontWeight: "bold",
+  },
+  typingIndicatorBar: {
+    paddingHorizontal: 16,
+    paddingVertical: 6,
+    backgroundColor: "#f7fafc",
+    borderTopWidth: 1,
+    borderTopColor: "#edf2f7",
+  },
+  typingIndicatorText: {
+    fontSize: 12,
+    fontStyle: "italic",
+    color: "#805ad5",
+    fontWeight: "600",
   },
   chatInputRow: {
     flexDirection: "row",

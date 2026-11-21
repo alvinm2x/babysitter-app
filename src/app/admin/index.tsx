@@ -308,12 +308,27 @@ export default function AdminDashboardScreen() {
   const router = useRouter();
   const chatScrollRef = useRef<ScrollView | null>(null);
 
+  // Refs para Chat 2.0 en Torre de Control (#24 Fase 2)
+  const adminUserIdRef = useRef<string | null>(null);
+  const trackedRequestIdsRef = useRef<string[]>([]);
+  const isChatOpenRef = useRef<boolean>(false);
+  const activeChatReqIdRef = useRef<string | null>(null);
+  const typingChannelRef = useRef<any>(null);
+  const lastTypingEmitRef = useRef<number>(0);
+  const typingStopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const typingClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+
   const [activeTab, setActiveTab] = useState<"alerts" | "finance">("alerts");
   const [loading, setLoading] = useState(true);
   const [requests, setRequests] = useState<any[]>([]);
   const [msgCountsMap, setMsgCountsMap] = useState<{ [key: string]: number }>(
     {},
   );
+  const [unreadCountsMap, setUnreadCountsMap] = useState<{
+    [key: string]: number;
+  }>({});
   const [updatingId, setUpdatingId] = useState<string | null>(null);
   const [emailStatusMap, setEmailStatusMap] = useState<{
     [key: string]: string;
@@ -326,7 +341,7 @@ export default function AdminDashboardScreen() {
   // DETALLE INTERACTIVO DE ESCROW ACTIVO (ÍTEM #27)
   const [showEscrowDetail, setShowEscrowDetail] = useState(false);
 
-  // ESTADOS DEL CHAT OPERATIVO DE SOPORTE (ÍTEM #26)
+  // ESTADOS DEL CHAT OPERATIVO DE SOPORTE (ÍTEM #26 + #24 FASE 2)
   const [isChatOpen, setIsChatOpen] = useState(false);
   const [activeChatReq, setActiveChatReq] = useState<any | null>(null);
   const [messages, setMessages] = useState<any[]>([]);
@@ -335,25 +350,210 @@ export default function AdminDashboardScreen() {
     "both" | "parent" | "babysitter"
   >("both");
   const [sendingMessage, setSendingMessage] = useState(false);
+  const [participantReceipts, setParticipantReceipts] = useState<{
+    parent: string | null;
+    babysitter: string | null;
+  }>({ parent: null, babysitter: null });
+  const [typingIndicatorText, setTypingIndicatorText] = useState<string | null>(
+    null,
+  );
 
   const toggleBreakdown = (id: string) => {
     setExpandedBreakdownIds((prev) => ({ ...prev, [id]: !prev[id] }));
   };
 
   useEffect(() => {
-    fetchAdminData();
+    isChatOpenRef.current = isChatOpen;
+    activeChatReqIdRef.current = activeChatReq?.id
+      ? String(activeChatReq.id)
+      : null;
+  }, [isChatOpen, activeChatReq]);
+
+  const markAdminChatAsRead = async (reqId: string) => {
+    if (!reqId) return;
+    setUnreadCountsMap((prev) => ({ ...prev, [String(reqId)]: 0 }));
+
+    try {
+      let uid = adminUserIdRef.current;
+      if (!uid) {
+        const {
+          data: { user },
+        } = await supabase.auth.getUser();
+        uid = user?.id || null;
+        adminUserIdRef.current = uid;
+      }
+      if (!uid) return;
+
+      const nowIso = new Date().toISOString();
+      await supabase.from("chat_read_receipts").upsert(
+        {
+          request_id: reqId,
+          user_id: uid,
+          reader_role: "admin",
+          last_read_at: nowIso,
+          updated_at: nowIso,
+        },
+        { onConflict: "request_id,user_id,reader_role" },
+      );
+    } catch (err) {
+      console.error("Error marcando chat admin como leído:", err);
+    }
+  };
+
+  const loadParticipantReceipts = async (reqId: string) => {
+    try {
+      const { data, error } = await supabase
+        .from("chat_read_receipts")
+        .select("reader_role, last_read_at")
+        .eq("request_id", reqId)
+        .in("reader_role", ["parent", "babysitter"]);
+
+      if (!error && data) {
+        let parentRead: string | null = null;
+        let sitterRead: string | null = null;
+        data.forEach((row: any) => {
+          if (row.reader_role === "parent") {
+            if (
+              !parentRead ||
+              new Date(row.last_read_at).getTime() >
+                new Date(parentRead).getTime()
+            ) {
+              parentRead = row.last_read_at;
+            }
+          }
+          if (row.reader_role === "babysitter") {
+            if (
+              !sitterRead ||
+              new Date(row.last_read_at).getTime() >
+                new Date(sitterRead).getTime()
+            ) {
+              sitterRead = row.last_read_at;
+            }
+          }
+        });
+        setParticipantReceipts({ parent: parentRead, babysitter: sitterRead });
+      }
+    } catch (err) {
+      console.error("Error cargando recibos de lectura de participantes:", err);
+    }
+  };
+
+  const emitAdminTypingEvent = (isTyping: boolean) => {
+    const channel = typingChannelRef.current;
+    if (!channel) return;
+    try {
+      channel.send({
+        type: "broadcast",
+        event: "typing",
+        payload: {
+          role: "admin",
+          name: "Soporte MiBabysitter",
+          isTyping,
+        },
+      });
+    } catch {}
+  };
+
+  const handleAdminTextChange = (text: string) => {
+    setNewMessage(text);
+    if (!isChatOpen || !activeChatReq?.id) return;
+
+    if (!text.trim()) {
+      if (typingStopTimerRef.current) clearTimeout(typingStopTimerRef.current);
+      emitAdminTypingEvent(false);
+      return;
+    }
+
+    const now = Date.now();
+    if (now - lastTypingEmitRef.current > 1500) {
+      lastTypingEmitRef.current = now;
+      emitAdminTypingEvent(true);
+    }
+
+    if (typingStopTimerRef.current) clearTimeout(typingStopTimerRef.current);
+    typingStopTimerRef.current = setTimeout(() => {
+      emitAdminTypingEvent(false);
+    }, 2500);
+  };
+
+  useEffect(() => {
+    let bgMsgSub: any = null;
+
+    const initAdmin = async () => {
+      const {
+        data: { user },
+      } = await supabase.auth.getUser();
+      if (user) adminUserIdRef.current = user.id;
+
+      await fetchAdminData();
+
+      supabase.removeChannel(supabase.channel("admin_realtime_bg_msgs"));
+      bgMsgSub = supabase
+        .channel("admin_realtime_bg_msgs")
+        .on(
+          "postgres_changes",
+          {
+            event: "INSERT",
+            schema: "public",
+            table: "messages",
+          },
+          (payload) => {
+            const incoming: any = payload.new;
+            const rId = String(incoming?.request_id || "");
+            if (!rId || !trackedRequestIdsRef.current.includes(rId)) return;
+
+            const isSupport = Boolean(
+              incoming?.content?.startsWith("[Soporte"),
+            );
+
+            if (isChatOpenRef.current && activeChatReqIdRef.current === rId) {
+              markAdminChatAsRead(rId);
+              return;
+            }
+
+            setMsgCountsMap((prev) => ({
+              ...prev,
+              [rId]: (prev[rId] || 0) + 1,
+            }));
+
+            if (!isSupport) {
+              setUnreadCountsMap((prev) => ({
+                ...prev,
+                [rId]: (prev[rId] || 0) + 1,
+              }));
+            }
+          },
+        )
+        .subscribe();
+    };
+
+    initAdmin();
+
+    return () => {
+      if (bgMsgSub) supabase.removeChannel(bgMsgSub);
+    };
   }, []);
 
-  // MOTOR CHAT REALTIME 2.0 PARA INTERVENCIÓN ADMIN + FALLBACK POLLING 4S
+  // MOTOR CHAT REALTIME 2.0 + RECIBOS DE PARTICIPANTES + BROADCAST "ESCRIBIENDO..." + POLLING 4S
   useEffect(() => {
     let chatSub: any = null;
+    let receiptSub: any = null;
+    let typingSub: any = null;
     let pollInterval: any = null;
 
     if (isChatOpen && activeChatReq?.id) {
-      const reqId = activeChatReq.id;
+      const reqId = String(activeChatReq.id);
       loadMessages(reqId);
+      loadParticipantReceipts(reqId);
+      markAdminChatAsRead(reqId);
+
       const channelName = "admin_chat_" + reqId;
+      const receiptChannelName = "admin_receipts_" + reqId;
+      const typingChannelName = "chat_room_typing_" + reqId;
+
       supabase.removeChannel(supabase.channel(channelName));
+      supabase.removeChannel(supabase.channel(receiptChannelName));
+      supabase.removeChannel(supabase.channel(typingChannelName));
 
       chatSub = supabase
         .channel(channelName)
@@ -391,17 +591,86 @@ export default function AdminDashboardScreen() {
               }));
               return nextList;
             });
+            markAdminChatAsRead(reqId);
           },
         )
         .subscribe();
 
+      receiptSub = supabase
+        .channel(receiptChannelName)
+        .on(
+          "postgres_changes",
+          {
+            event: "*",
+            schema: "public",
+            table: "chat_read_receipts",
+            filter: "request_id=eq." + reqId,
+          },
+          (payload) => {
+            const row: any = payload.new;
+            if (row?.reader_role === "parent" && row?.last_read_at) {
+              setParticipantReceipts((prev) => ({
+                ...prev,
+                parent: row.last_read_at,
+              }));
+            } else if (row?.reader_role === "babysitter" && row?.last_read_at) {
+              setParticipantReceipts((prev) => ({
+                ...prev,
+                babysitter: row.last_read_at,
+              }));
+            }
+          },
+        )
+        .subscribe();
+
+      typingSub = supabase
+        .channel(typingChannelName, {
+          config: { broadcast: { self: false } },
+        })
+        .on("broadcast", { event: "typing" }, ({ payload }) => {
+          if (!payload || payload.role === "admin") return;
+
+          if (typingClearTimerRef.current) {
+            clearTimeout(typingClearTimerRef.current);
+          }
+
+          if (!payload.isTyping) {
+            setTypingIndicatorText(null);
+            return;
+          }
+
+          const label =
+            payload.role === "babysitter"
+              ? `👩‍🍼 ${activeChatReq.babysitter?.first_name || payload.name || "La niñera"} está escribiendo...`
+              : `👨‍👩‍👧 ${activeChatReq.parent?.parent_name || payload.name || "La familia"} está escribiendo...`;
+          setTypingIndicatorText(label);
+
+          typingClearTimerRef.current = setTimeout(() => {
+            setTypingIndicatorText(null);
+          }, 3200);
+        })
+        .subscribe();
+
+      typingChannelRef.current = typingSub;
+
       pollInterval = setInterval(() => {
         loadMessages(reqId, true);
+        loadParticipantReceipts(reqId);
       }, 4000);
     }
 
     return () => {
+      if (typingStopTimerRef.current) clearTimeout(typingStopTimerRef.current);
+      if (typingClearTimerRef.current)
+        clearTimeout(typingClearTimerRef.current);
+      if (typingChannelRef.current) {
+        emitAdminTypingEvent(false);
+        typingChannelRef.current = null;
+      }
+      setTypingIndicatorText(null);
       if (chatSub) supabase.removeChannel(chatSub);
+      if (receiptSub) supabase.removeChannel(receiptSub);
+      if (typingSub) supabase.removeChannel(typingSub);
       if (pollInterval) clearInterval(pollInterval);
     };
   }, [isChatOpen, activeChatReq]);
@@ -436,12 +705,18 @@ export default function AdminDashboardScreen() {
     setMessages([]);
     setNewMessage("");
     setNotifyTarget("both");
+    setParticipantReceipts({ parent: null, babysitter: null });
+    setTypingIndicatorText(null);
     setIsChatOpen(true);
+    if (req?.id) markAdminChatAsRead(String(req.id));
   };
 
   const sendAdminMessage = async () => {
     const rawText = newMessage.trim();
     if (!rawText || !activeChatReq?.id || sendingMessage) return;
+
+    if (typingStopTimerRef.current) clearTimeout(typingStopTimerRef.current);
+    emitAdminTypingEvent(false);
 
     const cleanBody = stripSupportPrefix(rawText);
     const formattedText = `[Soporte MiBabysitter]: ${cleanBody}`;
@@ -503,6 +778,8 @@ export default function AdminDashboardScreen() {
           return nextList;
         });
       }
+
+      markAdminChatAsRead(String(activeChatReq.id));
 
       // Notificación institucional en campanita (deduplicada por usuario)
       const preview =
@@ -577,13 +854,17 @@ export default function AdminDashboardScreen() {
 
       if (reqError) throw reqError;
       if (!reqs || reqs.length === 0) {
+        trackedRequestIdsRef.current = [];
         setRequests([]);
         setMsgCountsMap({});
+        setUnreadCountsMap({});
         setLoading(false);
         return;
       }
 
-      const reqIds = reqs.map((r) => r.id).filter(Boolean);
+      const reqIds = reqs.map((r) => String(r.id)).filter(Boolean);
+      trackedRequestIdsRef.current = reqIds;
+
       const parentIds = Array.from(
         new Set(reqs.map((r) => r.parent_id).filter(Boolean)),
       );
@@ -595,15 +876,51 @@ export default function AdminDashboardScreen() {
       let babysittersMap: { [key: string]: any } = {};
       let nameMap: { [key: string]: string } = {};
       const counts: { [key: string]: number } = {};
+      const unreadCounts: { [key: string]: number } = {};
 
       if (reqIds.length > 0) {
-        const { data: msgRows } = await supabase
-          .from("messages")
-          .select("request_id")
-          .in("request_id", reqIds);
-        msgRows?.forEach((m: any) => {
-          if (m.request_id) {
-            counts[m.request_id] = (counts[m.request_id] || 0) + 1;
+        let adminUid = adminUserIdRef.current;
+        if (!adminUid) {
+          const {
+            data: { user },
+          } = await supabase.auth.getUser();
+          adminUid = user?.id || null;
+          adminUserIdRef.current = adminUid;
+        }
+
+        const [msgRes, receiptsRes] = await Promise.all([
+          supabase
+            .from("messages")
+            .select("request_id, content, created_at")
+            .in("request_id", reqIds),
+          adminUid
+            ? supabase
+                .from("chat_read_receipts")
+                .select("request_id, last_read_at")
+                .in("request_id", reqIds)
+                .eq("user_id", adminUid)
+                .eq("reader_role", "admin")
+            : Promise.resolve({ data: [] as any[] }),
+        ]);
+
+        const adminReadMap: { [key: string]: number } = {};
+        receiptsRes.data?.forEach((r: any) => {
+          const ts = new Date(r.last_read_at).getTime();
+          if (!isNaN(ts)) adminReadMap[String(r.request_id)] = ts;
+        });
+
+        msgRes.data?.forEach((m: any) => {
+          if (!m.request_id) return;
+          const rId = String(m.request_id);
+          counts[rId] = (counts[rId] || 0) + 1;
+
+          const isSupport = Boolean(m.content?.startsWith("[Soporte"));
+          if (!isSupport) {
+            const msgTs = new Date(m.created_at).getTime();
+            const lastReadTs = adminReadMap[rId] || 0;
+            if (msgTs > lastReadTs) {
+              unreadCounts[rId] = (unreadCounts[rId] || 0) + 1;
+            }
           }
         });
       }
@@ -642,6 +959,7 @@ export default function AdminDashboardScreen() {
       }));
 
       setMsgCountsMap(counts);
+      setUnreadCountsMap(unreadCounts);
       setRequests(combined);
     } catch (error: any) {
       console.error("Error al cargar datos del admin:", error.message);
@@ -1125,7 +1443,8 @@ export default function AdminDashboardScreen() {
                 {sortedAlertCards.map(({ req, alert }) => {
                   const parentName = req.parent?.parent_name || "Familia";
                   const sitterName = req.babysitter?.first_name || "Niñera";
-                  const msgCount = msgCountsMap[req.id] || 0;
+                  const msgCount = msgCountsMap[String(req.id)] || 0;
+                  const unreadCount = unreadCountsMap[String(req.id)] || 0;
 
                   return (
                     <View
@@ -1197,10 +1516,20 @@ export default function AdminDashboardScreen() {
                           style={styles.actionBtnPurple}
                           onPress={() => handleOpenAdminChat(req)}
                         >
-                          <Text style={styles.actionBtnText}>
-                            💬 Abrir Chat Operativo ({msgCount}{" "}
-                            {msgCount === 1 ? "msg" : "msgs"})
-                          </Text>
+                          <View style={styles.chatBtnContentRow}>
+                            <Text style={styles.actionBtnText}>
+                              💬 Abrir Chat Operativo ({msgCount}{" "}
+                              {msgCount === 1 ? "msg" : "msgs"})
+                            </Text>
+                            {unreadCount > 0 && (
+                              <View style={styles.adminUnreadPill}>
+                                <Text style={styles.adminUnreadPillText}>
+                                  {unreadCount}{" "}
+                                  {unreadCount === 1 ? "nuevo" : "nuevos"}
+                                </Text>
+                              </View>
+                            )}
+                          </View>
                         </TouchableOpacity>
                       </View>
                     </View>
@@ -1332,7 +1661,9 @@ export default function AdminDashboardScreen() {
                         const sitterLast = req.babysitter?.last_name || "";
                         const sitterName =
                           `${sitterFirst} ${sitterLast}`.trim();
-                        const msgCount = msgCountsMap[req.id] || 0;
+                        const msgCount = msgCountsMap[String(req.id)] || 0;
+                        const unreadCount =
+                          unreadCountsMap[String(req.id)] || 0;
                         const isBusy = updatingId === req.id;
 
                         return (
@@ -1433,10 +1764,20 @@ export default function AdminDashboardScreen() {
                                 onPress={() => handleOpenAdminChat(req)}
                                 disabled={isBusy}
                               >
-                                <Text style={styles.actionBtnText}>
-                                  💬 Chat Operativo ({msgCount}{" "}
-                                  {msgCount === 1 ? "msg" : "msgs"})
-                                </Text>
+                                <View style={styles.chatBtnContentRow}>
+                                  <Text style={styles.actionBtnText}>
+                                    💬 Chat Operativo ({msgCount}{" "}
+                                    {msgCount === 1 ? "msg" : "msgs"})
+                                  </Text>
+                                  {unreadCount > 0 && (
+                                    <View style={styles.adminUnreadPill}>
+                                      <Text style={styles.adminUnreadPillText}>
+                                        {unreadCount}{" "}
+                                        {unreadCount === 1 ? "nuevo" : "nuevos"}
+                                      </Text>
+                                    </View>
+                                  )}
+                                </View>
                               </TouchableOpacity>
 
                               <View style={styles.escrowSecondaryActionsRow}>
@@ -1610,7 +1951,7 @@ export default function AdminDashboardScreen() {
         </TouchableOpacity>
       </View>
 
-      {/* MODAL DE CHAT OPERATIVO DE SOPORTE (ÍTEM #26 REFINADO) */}
+      {/* MODAL DE CHAT OPERATIVO DE SOPORTE (ÍTEM #26 + #24 FASE 2) */}
       {isChatOpen && activeChatReq && (
         <Modal
           visible={isChatOpen}
@@ -1706,6 +2047,20 @@ export default function AdminDashboardScreen() {
                       : msg.content;
                     const timeStr = formatMsgTime(msg.created_at);
 
+                    const msgTs = new Date(msg.created_at).getTime();
+                    const readByParent =
+                      Boolean(participantReceipts.parent) &&
+                      new Date(
+                        participantReceipts.parent as string,
+                      ).getTime() >=
+                        msgTs - 1000;
+                    const readBySitter =
+                      Boolean(participantReceipts.babysitter) &&
+                      new Date(
+                        participantReceipts.babysitter as string,
+                      ).getTime() >=
+                        msgTs - 1000;
+
                     return (
                       <View
                         key={msg.id || idx}
@@ -1732,9 +2087,28 @@ export default function AdminDashboardScreen() {
                           >
                             {senderLabel}
                           </Text>
-                          {Boolean(timeStr) && (
-                            <Text style={styles.msgTimeText}>{timeStr}</Text>
-                          )}
+                          <View style={styles.msgTimeCheckRow}>
+                            {Boolean(timeStr) && (
+                              <Text style={styles.msgTimeText}>{timeStr}</Text>
+                            )}
+                            {isSupport && (
+                              <Text
+                                style={
+                                  readByParent || readBySitter
+                                    ? styles.adminCheckRead
+                                    : styles.adminCheckSent
+                                }
+                              >
+                                {msg._optimistic
+                                  ? "🕒"
+                                  : readByParent && readBySitter
+                                    ? "✓✓"
+                                    : readByParent || readBySitter
+                                      ? "✓✓"
+                                      : "✓"}
+                              </Text>
+                            )}
+                          </View>
                         </View>
                         <Text
                           style={[
@@ -1752,6 +2126,42 @@ export default function AdminDashboardScreen() {
                 )}
               </ScrollView>
 
+              {/* ESTADO DE LECTURA POR ACTOR + INDICADOR ESCRIBIENDO (#24 FASE 2) */}
+              <View style={styles.readReceiptsStatusBar}>
+                <Text
+                  style={[
+                    styles.readReceiptItem,
+                    participantReceipts.parent && styles.readReceiptItemRead,
+                  ]}
+                >
+                  👨‍👩‍👧 Familia:{" "}
+                  {participantReceipts.parent
+                    ? `✓✓ Visto ${formatMsgTime(participantReceipts.parent)}`
+                    : "Sin leer"}
+                </Text>
+                <Text style={styles.readReceiptDivider}>•</Text>
+                <Text
+                  style={[
+                    styles.readReceiptItem,
+                    participantReceipts.babysitter &&
+                      styles.readReceiptItemRead,
+                  ]}
+                >
+                  👩‍🍼 Niñera:{" "}
+                  {participantReceipts.babysitter
+                    ? `✓✓ Visto ${formatMsgTime(participantReceipts.babysitter)}`
+                    : "Sin leer"}
+                </Text>
+              </View>
+
+              {Boolean(typingIndicatorText) && (
+                <View style={styles.typingIndicatorBar}>
+                  <Text style={styles.typingIndicatorText}>
+                    ✍️ {typingIndicatorText}
+                  </Text>
+                </View>
+              )}
+
               {/* PLANTILLAS CONCIERGE EDITABLES EN 1 CLIC */}
               <View style={styles.conciergeBar}>
                 <ScrollView
@@ -1763,7 +2173,7 @@ export default function AdminDashboardScreen() {
                     <TouchableOpacity
                       key={tpl.id}
                       style={styles.conciergeChip}
-                      onPress={() => setNewMessage(tpl.text)}
+                      onPress={() => handleAdminTextChange(tpl.text)}
                     >
                       <Text style={styles.conciergeChipText}>{tpl.label}</Text>
                     </TouchableOpacity>
@@ -1808,7 +2218,7 @@ export default function AdminDashboardScreen() {
                   style={styles.chatInput}
                   placeholder="Escribir como Soporte MiBabysitter..."
                   value={newMessage}
-                  onChangeText={setNewMessage}
+                  onChangeText={handleAdminTextChange}
                   onSubmitEditing={sendAdminMessage}
                   returnKeyType="send"
                   multiline
@@ -1934,8 +2344,27 @@ const styles = StyleSheet.create({
   actionBtnPurple: {
     backgroundColor: "#805ad5",
     paddingVertical: 10,
+    paddingHorizontal: 12,
     borderRadius: 8,
     alignItems: "center",
+  },
+  chatBtnContentRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+    flexWrap: "wrap",
+  },
+  adminUnreadPill: {
+    backgroundColor: "#e53e3e",
+    borderRadius: 10,
+    paddingHorizontal: 7,
+    paddingVertical: 2,
+  },
+  adminUnreadPillText: {
+    color: "#ffffff",
+    fontSize: 11,
+    fontWeight: "bold",
   },
   actionBtnDisabled: {
     backgroundColor: "#cbd5e0",
@@ -2222,7 +2651,7 @@ const styles = StyleSheet.create({
   },
   backButtonText: { color: "#ffffff", fontSize: 16, fontWeight: "bold" },
 
-  // ESTILOS DEL CHAT OPERATIVO ADMIN (3 ACTORES + CONCIERGE)
+  // ESTILOS DEL CHAT OPERATIVO ADMIN (3 ACTORES + CONCIERGE + RECIBOS)
   modalOverlay: {
     flex: 1,
     backgroundColor: "rgba(0,0,0,0.5)",
@@ -2235,7 +2664,7 @@ const styles = StyleSheet.create({
     borderRadius: 16,
     width: "100%",
     maxWidth: 520,
-    height: "86%",
+    height: "88%",
     display: "flex",
     flexDirection: "column",
     overflow: "hidden",
@@ -2329,6 +2758,11 @@ const styles = StyleSheet.create({
     gap: 10,
     marginBottom: 4,
   },
+  msgTimeCheckRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+  },
   senderTag: {
     fontSize: 11,
     fontWeight: "bold",
@@ -2337,7 +2771,55 @@ const styles = StyleSheet.create({
     fontSize: 10,
     color: "#718096",
   },
+  adminCheckSent: {
+    fontSize: 11,
+    color: "#975a16",
+    fontWeight: "bold",
+  },
+  adminCheckRead: {
+    fontSize: 11,
+    color: "#2b6cb0",
+    fontWeight: "bold",
+  },
   messageText: { fontSize: 14, lineHeight: 20 },
+
+  readReceiptsStatusBar: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    flexWrap: "wrap",
+    gap: 8,
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    backgroundColor: "#edf2f7",
+    borderTopWidth: 1,
+    borderTopColor: "#e2e8f0",
+  },
+  readReceiptItem: {
+    fontSize: 11,
+    color: "#718096",
+    fontWeight: "600",
+  },
+  readReceiptItemRead: {
+    color: "#2b6cb0",
+  },
+  readReceiptDivider: {
+    fontSize: 11,
+    color: "#a0aec0",
+  },
+  typingIndicatorBar: {
+    paddingHorizontal: 14,
+    paddingVertical: 5,
+    backgroundColor: "#f7fafc",
+    borderTopWidth: 1,
+    borderTopColor: "#edf2f7",
+  },
+  typingIndicatorText: {
+    fontSize: 12,
+    fontStyle: "italic",
+    color: "#805ad5",
+    fontWeight: "600",
+  },
 
   conciergeBar: {
     borderTopWidth: 1,
