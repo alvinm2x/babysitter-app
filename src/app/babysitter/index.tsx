@@ -33,6 +33,95 @@ const DAYS = [
 const SHIFTS = ["Mañana", "Tarde", "Noche"];
 const PLATFORM_COMMISSION_RATE = 0.3;
 
+const SANTIAGO_COMMUNES: { label: string; aliases: string[] }[] = [
+  {
+    label: "Santiago Centro",
+    aliases: ["santiago centro", "stgo centro", "santiago"],
+  },
+  { label: "Las Condes", aliases: ["las condes"] },
+  { label: "Providencia", aliases: ["providencia"] },
+  { label: "Vitacura", aliases: ["vitacura"] },
+  {
+    label: "Lo Barnechea",
+    aliases: ["lo barnechea", "barnechea", "la dehesa"],
+  },
+  { label: "Ñuñoa", aliases: ["nunoa", "ñuñoa"] },
+  { label: "La Reina", aliases: ["la reina"] },
+  { label: "Peñalolén", aliases: ["penalolen", "peñalolen", "peñalolén"] },
+  { label: "Macul", aliases: ["macul"] },
+  { label: "San Miguel", aliases: ["san miguel"] },
+  { label: "La Florida", aliases: ["la florida"] },
+  { label: "Huechuraba", aliases: ["huechuraba"] },
+  { label: "Independencia", aliases: ["independencia"] },
+  { label: "Recoleta", aliases: ["recoleta"] },
+  { label: "Estación Central", aliases: ["estacion central"] },
+  { label: "Maipú", aliases: ["maipu"] },
+  { label: "Puente Alto", aliases: ["puente alto"] },
+  { label: "Colina / Chicureo", aliases: ["chicureo", "colina"] },
+];
+
+const normalizeText = (text: string) =>
+  text
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+
+const extractApproximateZone = (
+  address?: string | null,
+  explicitZone?: string | null,
+) => {
+  if (explicitZone && explicitZone.trim()) {
+    return explicitZone.trim();
+  }
+  const raw = String(address || "").trim();
+  if (!raw) return "Sector no especificado";
+
+  const normalized = normalizeText(raw);
+  for (const commune of SANTIAGO_COMMUNES) {
+    if (
+      commune.aliases.some((alias) => normalized.includes(normalizeText(alias)))
+    ) {
+      return commune.label;
+    }
+  }
+
+  const segments = raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  for (let i = segments.length - 1; i >= 0; i--) {
+    const seg = segments[i];
+    const normSeg = normalizeText(seg);
+    const hasNumbers = /\d/.test(seg);
+    const looksLikeStreetOrApt =
+      /(av\.|avenida|calle|pasaje|psje|depto|dpto|dto|piso|torre|casa|block|of\.|oficina|chile|region metropolitana|\brm\b)/i.test(
+        normSeg,
+      );
+    if (
+      !hasNumbers &&
+      !looksLikeStreetOrApt &&
+      seg.length >= 3 &&
+      seg.length <= 35
+    ) {
+      return seg;
+    }
+  }
+
+  return "Sector protegido (Santiago)";
+};
+
+const isLocationUnlocked = (status?: string, paymentStatus?: string) => {
+  const s = String(status || "")
+    .toLowerCase()
+    .trim();
+  const p = String(paymentStatus || "")
+    .toLowerCase()
+    .trim();
+  const isPaidOrHeld =
+    p === "held" || p === "ready_for_payout" || p === "paid_out";
+  return s === "accepted" && isPaidOrHeld;
+};
+
 const showAlert = (title: string, message: string) => {
   if (Platform.OS === "web") {
     alert(title + ": " + message);
@@ -151,7 +240,7 @@ export default function BabysitterHomeScreen() {
     setExpandedBreakdownIds((prev) => ({ ...prev, [id]: !prev[id] }));
   };
 
-  // NUEVO: ATERRIZAJE INTELIGENTE POR ?requestId=<ID> (ÍTEM #20 FASE 2)
+  // ATERRIZAJE INTELIGENTE POR ?requestId=<ID> (ÍTEM #20 FASE 2)
   useEffect(() => {
     if (!paramRequestId || loadingRequests || requests.length === 0) return;
 
@@ -970,6 +1059,16 @@ export default function BabysitterHomeScreen() {
                   const parentDisplayName = parentInfo.parent_name || "Familia";
                   const isAccepted = statusNormalized === "accepted";
 
+                  // PRIVACIDAD ESCALONADA (#22 FASE 2)
+                  const exactLocationUnlocked = isLocationUnlocked(
+                    req.status,
+                    req.payment_status,
+                  );
+                  const approximateZone = extractApproximateZone(
+                    parentInfo.address,
+                    req.location_zone || parentInfo.comuna,
+                  );
+
                   const reqHours = getHoursFromTimeRange(req.job_time);
                   const myRate = Number(hourlyRate.replace(/\D/g, "")) || 10000;
                   const reqTotal =
@@ -1033,7 +1132,7 @@ export default function BabysitterHomeScreen() {
                         </Text>
                       </View>
 
-                      {(req.job_date || req.job_time) && (
+                      {(req.job_date || req.job_time || parentInfo.address) && (
                         <View style={styles.jobDetailsBox}>
                           <Text style={styles.jobDetailsText}>
                             📅 Fecha: {req.job_date || "No especificado"}
@@ -1042,11 +1141,22 @@ export default function BabysitterHomeScreen() {
                             ⏰ Horario: {req.job_time || "No especificado"} (
                             {reqHours} hrs)
                           </Text>
-                          {parentInfo.address ? (
-                            <Text style={styles.jobDetailsText}>
-                              📍 Sector: {parentInfo.address}
-                            </Text>
-                          ) : null}
+                          <Text style={styles.jobDetailsText}>
+                            📍 Comuna aproximada: {approximateZone}
+                          </Text>
+                        </View>
+                      )}
+
+                      {!exactLocationUnlocked && (
+                        <View style={styles.privacyLockBanner}>
+                          <Text style={styles.privacyLockTitle}>
+                            🔒 Dirección exacta y teléfono protegidos
+                          </Text>
+                          <Text style={styles.privacyLockDesc}>
+                            Por seguridad de las familias, la dirección exacta y
+                            el WhatsApp se desbloquean automáticamente al
+                            confirmar la reserva con pago protegido.
+                          </Text>
                         </View>
                       )}
 
@@ -1145,25 +1255,56 @@ export default function BabysitterHomeScreen() {
 
                       {isAccepted && (
                         <View style={styles.parentContactBox}>
-                          <Text style={styles.contactBoxTitle}>
-                            📍 Datos de la Familia ({parentDisplayName})
-                          </Text>
-                          <Text style={styles.contactText}>
-                            🏠 Dirección:{" "}
-                            {parentInfo.address || "No especificada"}
-                          </Text>
-                          <Text style={styles.contactText}>
-                            👶 Niños:{" "}
-                            {parentInfo.children_info || "No especificado"}
-                          </Text>
-                          <Text style={styles.contactText}>
-                            📞 Teléfono: {parentInfo.phone || "No especificado"}
-                          </Text>
-                          {parentInfo.emergency_contact ? (
-                            <Text style={styles.contactText}>
-                              🚨 Emergencia: {parentInfo.emergency_contact}
+                          <View style={styles.contactBoxHeaderRow}>
+                            <Text style={styles.contactBoxTitle}>
+                              📍 Datos de la Familia ({parentDisplayName})
                             </Text>
-                          ) : null}
+                            {exactLocationUnlocked && (
+                              <View style={styles.unlockedPill}>
+                                <Text style={styles.unlockedPillText}>
+                                  🔓 Desbloqueado
+                                </Text>
+                              </View>
+                            )}
+                          </View>
+
+                          {exactLocationUnlocked ? (
+                            <>
+                              <Text style={styles.contactText}>
+                                🏠 Dirección exacta:{" "}
+                                <Text style={{ fontWeight: "600" }}>
+                                  {parentInfo.address || "No especificada"}
+                                </Text>
+                              </Text>
+                              <Text style={styles.contactText}>
+                                👶 Niños:{" "}
+                                {parentInfo.children_info || "No especificado"}
+                              </Text>
+                              <Text style={styles.contactText}>
+                                📞 Teléfono:{" "}
+                                {parentInfo.phone || "No especificado"}
+                              </Text>
+                              {parentInfo.emergency_contact ? (
+                                <Text style={styles.contactText}>
+                                  🚨 Emergencia: {parentInfo.emergency_contact}
+                                </Text>
+                              ) : null}
+                            </>
+                          ) : (
+                            <>
+                              <Text style={styles.contactText}>
+                                📍 Comuna: {approximateZone}
+                              </Text>
+                              <Text style={styles.contactTextMuted}>
+                                🔒 Dirección exacta y teléfono disponibles al
+                                acreditarse el pago.
+                              </Text>
+                              <Text style={styles.contactText}>
+                                👶 Niños:{" "}
+                                {parentInfo.children_info || "No especificado"}
+                              </Text>
+                            </>
+                          )}
 
                           <TouchableOpacity
                             style={styles.chatAppButton}
@@ -1189,7 +1330,9 @@ export default function BabysitterHomeScreen() {
                                 "Trabajo con Familia " + parentDisplayName,
                                 req.job_date,
                                 req.job_time,
-                                parentInfo.address,
+                                exactLocationUnlocked
+                                  ? parentInfo.address
+                                  : approximateZone,
                               )
                             }
                           >
@@ -1198,21 +1341,22 @@ export default function BabysitterHomeScreen() {
                             </Text>
                           </TouchableOpacity>
 
-                          {Boolean(parentInfo.phone) && (
-                            <TouchableOpacity
-                              style={[
-                                styles.contactButton,
-                                styles.whatsappButton,
-                              ]}
-                              onPress={() =>
-                                handleOpenWhatsApp(parentInfo.phone)
-                              }
-                            >
-                              <Text style={styles.contactButtonText}>
-                                📱 WhatsApp con {parentDisplayName}
-                              </Text>
-                            </TouchableOpacity>
-                          )}
+                          {exactLocationUnlocked &&
+                            Boolean(parentInfo.phone) && (
+                              <TouchableOpacity
+                                style={[
+                                  styles.contactButton,
+                                  styles.whatsappButton,
+                                ]}
+                                onPress={() =>
+                                  handleOpenWhatsApp(parentInfo.phone)
+                                }
+                              >
+                                <Text style={styles.contactButtonText}>
+                                  📱 WhatsApp con {parentDisplayName}
+                                </Text>
+                              </TouchableOpacity>
+                            )}
                         </View>
                       )}
 
@@ -1337,6 +1481,10 @@ export default function BabysitterHomeScreen() {
                   const parentDisplayName = parentInfo.parent_name || "Familia";
                   const isCompleted = statusNormalized === "completed";
                   const isRejected = statusNormalized === "rejected";
+                  const approximateZone = extractApproximateZone(
+                    parentInfo.address,
+                    req.location_zone || parentInfo.comuna,
+                  );
 
                   const histHours = getHoursFromTimeRange(req.job_time);
                   const myRate = Number(hourlyRate.replace(/\D/g, "")) || 10000;
@@ -1501,8 +1649,11 @@ export default function BabysitterHomeScreen() {
                             📍 Familia atendida ({parentDisplayName})
                           </Text>
                           <Text style={styles.contactText}>
-                            🏠 Dirección:{" "}
-                            {parentInfo.address || "No especificada"}
+                            🗺️ Comuna: {approximateZone}
+                          </Text>
+                          <Text style={styles.historyPrivacyNote}>
+                            🔒 Dirección exacta archivada al finalizar el turno
+                            por privacidad de la familia.
                           </Text>
                         </View>
                       )}
@@ -2072,7 +2223,32 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     marginBottom: 12,
   },
-  jobDetailsText: { fontSize: 14, color: "#2b6cb0", fontWeight: "600" },
+  jobDetailsText: {
+    fontSize: 14,
+    color: "#2b6cb0",
+    fontWeight: "600",
+    marginBottom: 2,
+  },
+
+  privacyLockBanner: {
+    backgroundColor: "#fffaf0",
+    borderWidth: 1,
+    borderColor: "#fbd38d",
+    borderRadius: 8,
+    padding: 10,
+    marginBottom: 12,
+  },
+  privacyLockTitle: {
+    fontSize: 13,
+    fontWeight: "bold",
+    color: "#9c4221",
+    marginBottom: 2,
+  },
+  privacyLockDesc: {
+    fontSize: 12,
+    color: "#744210",
+    lineHeight: 16,
+  },
 
   breakdownToggleBtn: {
     flexDirection: "row",
@@ -2162,13 +2338,43 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     marginBottom: 12,
   },
+  contactBoxHeaderRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 8,
+    gap: 8,
+  },
   contactBoxTitle: {
     fontSize: 15,
     fontWeight: "bold",
     color: "#4a5568",
-    marginBottom: 6,
+    flex: 1,
+  },
+  unlockedPill: {
+    backgroundColor: "#c6f6d5",
+    paddingVertical: 3,
+    paddingHorizontal: 8,
+    borderRadius: 10,
+  },
+  unlockedPillText: {
+    fontSize: 11,
+    fontWeight: "bold",
+    color: "#22543d",
   },
   contactText: { fontSize: 14, color: "#4a5568", marginBottom: 4 },
+  contactTextMuted: {
+    fontSize: 13,
+    color: "#9c4221",
+    fontStyle: "italic",
+    marginBottom: 6,
+  },
+  historyPrivacyNote: {
+    fontSize: 12,
+    color: "#718096",
+    fontStyle: "italic",
+    marginTop: 4,
+  },
 
   contactButton: {
     paddingVertical: 10,
