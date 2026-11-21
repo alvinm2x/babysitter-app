@@ -1,3 +1,4 @@
+import GoogleSignInButton from "@/components/GoogleSignInButton";
 import { supabase } from "@/utils/supabase";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { useEffect, useRef, useState } from "react";
@@ -43,7 +44,6 @@ export default function LoginScreen() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
-  const [loadingGoogle, setLoadingGoogle] = useState(false);
   const [checkingSession, setCheckingSession] = useState(true);
 
   const [showPassword, setShowPassword] = useState(false);
@@ -135,7 +135,7 @@ export default function LoginScreen() {
       }
     }
 
-    // 2. Verificar si ya existe sesión activa (ej. regreso desde Google OAuth)
+    // 2. Verificar si ya existe sesión activa
     supabase.auth.getSession().then(({ data: { session } }) => {
       if (session?.user) {
         routeAuthenticatedUser(session.user);
@@ -189,45 +189,6 @@ export default function LoginScreen() {
       showAlert("Error de Inicio de Sesión", error.message);
     } else if (data.user) {
       await routeAuthenticatedUser(data.user);
-    }
-  };
-
-  const handleGoogleLogin = async () => {
-    if (Platform.OS !== "web" || typeof window === "undefined") {
-      showAlert(
-        "Próximamente en móvil",
-        "El inicio con Google está habilitado en la versión web (mibabysitter.cl).",
-      );
-      return;
-    }
-
-    if (paramRequestId) {
-      savePendingRequestId(String(paramRequestId));
-    }
-
-    setLoadingGoogle(true);
-    try {
-      const { error } = await supabase.auth.signInWithOAuth({
-        provider: "google",
-        options: {
-          redirectTo: window.location.origin,
-          queryParams: {
-            access_type: "offline",
-            prompt: "select_account",
-          },
-        },
-      });
-
-      if (error) {
-        showAlert("Error con Google", error.message);
-        setLoadingGoogle(false);
-      }
-    } catch (err: any) {
-      showAlert(
-        "Error con Google",
-        err.message || "No se pudo iniciar con Google.",
-      );
-      setLoadingGoogle(false);
     }
   };
 
@@ -432,24 +393,14 @@ export default function LoginScreen() {
               </View>
             ) : (
               <>
-                <TouchableOpacity
-                  style={styles.googleButton}
-                  onPress={handleGoogleLogin}
-                  disabled={loadingGoogle || loading}
-                >
-                  {loadingGoogle ? (
-                    <ActivityIndicator color="#2d3748" />
-                  ) : (
-                    <View style={styles.googleButtonInner}>
-                      <View style={styles.googleBadge}>
-                        <Text style={styles.googleBadgeText}>G</Text>
-                      </View>
-                      <Text style={styles.googleButtonText}>
-                        Continuar con Google
-                      </Text>
-                    </View>
-                  )}
-                </TouchableOpacity>
+                <GoogleSignInButton
+                  mode="signin"
+                  disabled={loading}
+                  onSuccess={async (user) => {
+                    await routeAuthenticatedUser(user);
+                  }}
+                  onError={(msg) => showAlert("Error con Google", msg)}
+                />
 
                 <View style={styles.dividerRow}>
                   <View style={styles.dividerLine} />
@@ -502,7 +453,7 @@ export default function LoginScreen() {
                 <TouchableOpacity
                   style={styles.button}
                   onPress={handleLogin}
-                  disabled={loading || loadingGoogle}
+                  disabled={loading}
                 >
                   {loading ? (
                     <ActivityIndicator color="#fff" />
@@ -549,48 +500,6 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   subtitle: { fontSize: 16, color: "#718096", marginBottom: 28 },
-
-  googleButton: {
-    backgroundColor: "#ffffff",
-    borderWidth: 1.5,
-    borderColor: "#cbd5e0",
-    paddingVertical: 13,
-    paddingHorizontal: 16,
-    borderRadius: 10,
-    alignItems: "center",
-    marginBottom: 20,
-    shadowColor: "#000",
-    shadowOpacity: 0.04,
-    shadowRadius: 4,
-    shadowOffset: { width: 0, height: 2 },
-    elevation: 1,
-  },
-  googleButtonInner: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 10,
-  },
-  googleBadge: {
-    width: 24,
-    height: 24,
-    borderRadius: 12,
-    backgroundColor: "#ebf8ff",
-    borderWidth: 1,
-    borderColor: "#90cdf4",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  googleBadgeText: {
-    color: "#2b6cb0",
-    fontWeight: "bold",
-    fontSize: 14,
-  },
-  googleButtonText: {
-    color: "#1a202c",
-    fontSize: 16,
-    fontWeight: "600",
-  },
 
   dividerRow: {
     flexDirection: "row",
