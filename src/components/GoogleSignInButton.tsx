@@ -1,11 +1,10 @@
 import { supabase } from "@/utils/supabase";
-import { useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Platform,
   StyleSheet,
   Text,
-  TouchableOpacity,
   View,
 } from "react-native";
 
@@ -22,7 +21,9 @@ interface GoogleSignInButtonProps {
   disabled?: boolean;
 }
 
-const GOOGLE_WEB_CLIENT_ID = process.env.EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID || "";
+const GOOGLE_WEB_CLIENT_ID = (
+  process.env.EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID || ""
+).trim();
 
 const generateNoncePair = async () => {
   const randomBytes = new Uint8Array(32);
@@ -49,13 +50,14 @@ export default function GoogleSignInButton({
   onError,
   disabled = false,
 }: GoogleSignInButtonProps) {
-  const buttonContainerRef = useRef<any>(null);
+  const buttonContainerRef = useRef<HTMLDivElement | null>(null);
   const onSuccessRef = useRef(onSuccess);
   const onErrorRef = useRef(onError);
   const rawNonceRef = useRef<string>("");
 
   const [gisReady, setGisReady] = useState(false);
   const [authenticating, setAuthenticating] = useState(false);
+  const [configError, setConfigError] = useState<string | null>(null);
 
   useEffect(() => {
     onSuccessRef.current = onSuccess;
@@ -63,25 +65,30 @@ export default function GoogleSignInButton({
   }, [onSuccess, onError]);
 
   useEffect(() => {
-    if (
-      Platform.OS !== "web" ||
-      typeof window === "undefined" ||
-      !GOOGLE_WEB_CLIENT_ID
-    ) {
+    if (Platform.OS !== "web" || typeof window === "undefined") {
       return;
     }
 
+    if (!GOOGLE_WEB_CLIENT_ID) {
+      setConfigError(
+        "Falta EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID en el build de Vercel.",
+      );
+      return;
+    }
+
+    setConfigError(null);
     let cancelled = false;
+    let pollTimer: ReturnType<typeof setInterval> | null = null;
 
     const initGoogleButton = async () => {
-      if (cancelled || !window.google?.accounts?.id) return;
+      if (cancelled || !window.google?.accounts?.id) return false;
 
       const containerEl = buttonContainerRef.current;
-      if (!containerEl || typeof containerEl.innerHTML === "undefined") return;
+      if (!containerEl) return false;
 
       try {
         const { rawNonce, hashedNonce } = await generateNoncePair();
-        if (cancelled) return;
+        if (cancelled) return true;
         rawNonceRef.current = rawNonce;
 
         window.google.accounts.id.initialize({
@@ -121,7 +128,7 @@ export default function GoogleSignInButton({
         });
 
         containerEl.innerHTML = "";
-        const measuredWidth = containerEl.offsetWidth || 360;
+        const measuredWidth = Math.round(containerEl.offsetWidth || 320);
         const clampedWidth = Math.min(Math.max(measuredWidth, 240), 400);
 
         window.google.accounts.id.renderButton(containerEl, {
@@ -136,72 +143,50 @@ export default function GoogleSignInButton({
         });
 
         setGisReady(true);
+        return true;
       } catch (err) {
         console.error("Error inicializando Google Identity Services:", err);
+        setConfigError("No se pudo cargar el botón oficial de Google.");
+        return true;
       }
     };
 
-    if (window.google?.accounts?.id) {
-      initGoogleButton();
-    } else {
-      const scriptId = "google-gsi-client";
-      let script = document.getElementById(
-        scriptId,
-      ) as HTMLScriptElement | null;
-
-      if (!script) {
-        script = document.createElement("script");
-        script.id = scriptId;
-        script.src = "https://accounts.google.com/gsi/client";
-        script.async = true;
-        script.defer = true;
-        document.head.appendChild(script);
-      }
-
-      const handleLoad = () => {
-        initGoogleButton();
-      };
-
-      script.addEventListener("load", handleLoad);
-      return () => {
-        cancelled = true;
-        script?.removeEventListener("load", handleLoad);
-      };
+    const scriptId = "google-gsi-client";
+    if (!document.getElementById(scriptId)) {
+      const script = document.createElement("script");
+      script.id = scriptId;
+      script.src = "https://accounts.google.com/gsi/client";
+      script.async = true;
+      script.defer = true;
+      document.head.appendChild(script);
     }
+
+    let attempts = 0;
+    const tryMount = async () => {
+      attempts += 1;
+      const mounted = await initGoogleButton();
+      if (mounted && pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      } else if (attempts >= 40 && pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+        if (!cancelled) {
+          setConfigError(
+            "Google tardó demasiado en responder. Recarga la página.",
+          );
+        }
+      }
+    };
+
+    tryMount();
+    pollTimer = setInterval(tryMount, 150);
 
     return () => {
       cancelled = true;
+      if (pollTimer) clearInterval(pollTimer);
     };
   }, [mode]);
-
-  // Fallback seguro si aún no se agrega EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID
-  const handleFallbackOAuth = async () => {
-    if (Platform.OS !== "web" || typeof window === "undefined") {
-      onError("El inicio con Google está disponible en la versión web.");
-      return;
-    }
-
-    setAuthenticating(true);
-    try {
-      const { error } = await supabase.auth.signInWithOAuth({
-        provider: "google",
-        options: {
-          redirectTo: window.location.origin,
-          queryParams: {
-            access_type: "offline",
-            prompt: "select_account",
-          },
-        },
-      });
-      if (error) {
-        onError(error.message);
-        setAuthenticating(false);
-      }
-    } catch (err: any) {
-      onError(err?.message || "No se pudo iniciar con Google.");
-      setAuthenticating(false);
-    }
-  };
 
   if (Platform.OS !== "web") {
     return null;
@@ -216,33 +201,33 @@ export default function GoogleSignInButton({
         </View>
       )}
 
-      {GOOGLE_WEB_CLIENT_ID ? (
-        <View
-          ref={buttonContainerRef}
-          style={[
-            styles.gisContainer,
-            (disabled || authenticating) && styles.disabledBox,
-          ]}
-        />
-      ) : null}
-
-      {(!GOOGLE_WEB_CLIENT_ID || !gisReady) && !authenticating && (
-        <TouchableOpacity
-          style={styles.fallbackButton}
-          onPress={handleFallbackOAuth}
-          disabled={disabled || authenticating}
-        >
-          <View style={styles.fallbackInner}>
-            <View style={styles.googleBadge}>
-              <Text style={styles.googleBadgeText}>G</Text>
+      {configError ? (
+        <View style={styles.errorBox}>
+          <Text style={styles.errorText}>{configError}</Text>
+        </View>
+      ) : (
+        <>
+          {!gisReady && !authenticating && (
+            <View style={styles.loadingOverlay}>
+              <ActivityIndicator size="small" color="#718096" />
+              <Text style={styles.loadingText}>
+                Cargando botón de Google...
+              </Text>
             </View>
-            <Text style={styles.fallbackText}>
-              {mode === "signup"
-                ? "Registrarse con Google"
-                : "Continuar con Google"}
-            </Text>
-          </View>
-        </TouchableOpacity>
+          )}
+          {React.createElement("div", {
+            ref: buttonContainerRef,
+            style: {
+              width: "100%",
+              display: "flex",
+              justifyContent: "center",
+              alignItems: "center",
+              minHeight: gisReady ? 44 : 0,
+              opacity: disabled || authenticating ? 0.5 : 1,
+              pointerEvents: disabled || authenticating ? "none" : "auto",
+            },
+          })}
+        </>
       )}
     </View>
   );
@@ -256,68 +241,35 @@ const styles = StyleSheet.create({
     alignItems: "center",
     marginBottom: 16,
   },
-  gisContainer: {
-    width: "100%",
-    alignItems: "center",
-    justifyContent: "center",
-    minHeight: 44,
-  },
-  disabledBox: {
-    opacity: 0.5,
-    pointerEvents: "none" as any,
-  },
   loadingOverlay: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
     gap: 10,
-    paddingVertical: 12,
+    paddingVertical: 11,
     width: "100%",
     backgroundColor: "#f7fafc",
     borderRadius: 8,
     borderWidth: 1,
     borderColor: "#e2e8f0",
-    marginBottom: 8,
+    marginBottom: 6,
   },
   loadingText: {
-    color: "#2d3748",
-    fontSize: 15,
-    fontWeight: "600",
-  },
-  fallbackButton: {
-    width: "100%",
-    backgroundColor: "#ffffff",
-    borderWidth: 1.5,
-    borderColor: "#cbd5e0",
-    paddingVertical: 12,
-    paddingHorizontal: 16,
-    borderRadius: 8,
-    alignItems: "center",
-  },
-  fallbackInner: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 10,
-  },
-  googleBadge: {
-    width: 24,
-    height: 24,
-    borderRadius: 12,
-    backgroundColor: "#ebf8ff",
-    borderWidth: 1,
-    borderColor: "#90cdf4",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  googleBadgeText: {
-    color: "#2b6cb0",
-    fontWeight: "bold",
+    color: "#4a5568",
     fontSize: 14,
-  },
-  fallbackText: {
-    color: "#1a202c",
-    fontSize: 15,
     fontWeight: "600",
+  },
+  errorBox: {
+    width: "100%",
+    padding: 12,
+    borderRadius: 8,
+    backgroundColor: "#fff5f5",
+    borderWidth: 1,
+    borderColor: "#feb2b2",
+  },
+  errorText: {
+    color: "#c53030",
+    fontSize: 13,
+    textAlign: "center",
   },
 });
