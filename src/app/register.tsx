@@ -23,7 +23,6 @@ export default function RegisterScreen() {
   const [role, setRole] = useState<"parent" | "babysitter">("parent");
   const [loading, setLoading] = useState(false);
 
-  // Estados para el toggle de visibilidad del ojito
   const [showPassword, setShowPassword] = useState(false);
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
 
@@ -60,63 +59,6 @@ export default function RegisterScreen() {
     }
   };
 
-  const handleGoogleRegisterSuccess = async (user: any) => {
-    setLoading(true);
-    try {
-      // Si el usuario ya tenía cuenta previa, respetamos su perfil existente (sin pisar is_admin ni su rol)
-      const { data: existingProfile } = await supabase
-        .from("profiles")
-        .select("is_admin, role")
-        .eq("id", user.id)
-        .maybeSingle();
-
-      if (existingProfile?.is_admin) {
-        router.replace("/");
-        return;
-      }
-
-      if (existingProfile?.role === "babysitter") {
-        router.replace("/babysitter");
-        return;
-      }
-
-      if (existingProfile?.role === "parent") {
-        router.replace("/parent");
-        return;
-      }
-
-      // Usuario nuevo: creamos su perfil directo con el rol seleccionado arriba
-      const googleName =
-        user.user_metadata?.full_name ||
-        user.user_metadata?.name ||
-        user.email?.split("@")[0] ||
-        "Usuario";
-
-      const { error: profileError } = await supabase.from("profiles").upsert(
-        {
-          id: user.id,
-          full_name: googleName,
-          role: role,
-          is_admin: false,
-        },
-        { onConflict: "id" },
-      );
-
-      if (profileError) throw profileError;
-
-      await ensureRoleSubProfile(user.id, role, googleName);
-
-      router.replace(role === "babysitter" ? "/babysitter" : "/parent");
-    } catch (err: any) {
-      showAlert(
-        "Error al registrar con Google",
-        err.message || "Ocurrió un error inesperado.",
-      );
-    } finally {
-      setLoading(false);
-    }
-  };
-
   const handleRegister = async () => {
     if (!email || !password || !confirmPassword || !fullName) {
       showAlert("Campos requeridos", "Por favor completa todos los campos.");
@@ -144,7 +86,6 @@ export default function RegisterScreen() {
     try {
       const cleanName = fullName.trim();
 
-      // 1. Crear usuario en Supabase Auth
       const { data, error } = await supabase.auth.signUp({
         email: email.trim(),
         password,
@@ -155,7 +96,6 @@ export default function RegisterScreen() {
 
       if (error) throw error;
 
-      // 2. Guardar explícitamente en la tabla de perfiles y subperfil antes de redirigir
       if (data.user) {
         const { error: profileError } = await supabase.from("profiles").upsert({
           id: data.user.id,
@@ -174,7 +114,6 @@ export default function RegisterScreen() {
         `Registrado como ${role === "babysitter" ? "Babysitter" : "Familia"}`,
       );
 
-      // Redirigir según el rol seleccionado
       if (role === "babysitter") {
         router.replace("/babysitter");
       } else {
@@ -201,7 +140,6 @@ export default function RegisterScreen() {
           Selecciona tu perfil e ingresa tus datos
         </Text>
 
-        {/* Seleccionar Rol */}
         <View style={styles.roleContainer}>
           <TouchableOpacity
             style={[
@@ -240,8 +178,8 @@ export default function RegisterScreen() {
 
         <GoogleSignInButton
           mode="signup"
+          preselectedRole={role}
           disabled={loading}
-          onSuccess={handleGoogleRegisterSuccess}
           onError={(msg) => showAlert("Error con Google", msg)}
         />
 
