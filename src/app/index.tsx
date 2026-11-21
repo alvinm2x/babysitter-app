@@ -1,4 +1,7 @@
-import GoogleSignInButton from "@/components/GoogleSignInButton";
+import GoogleSignInButton, {
+  consumeGoogleRawNonce,
+  consumePendingGoogleRole,
+} from "@/components/GoogleSignInButton";
 import { supabase } from "@/utils/supabase";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { useEffect, useRef, useState } from "react";
@@ -49,7 +52,6 @@ export default function LoginScreen() {
   const [showPassword, setShowPassword] = useState(false);
   const [isAdminTester, setIsAdminTester] = useState(false);
 
-  // Estado para usuarios nuevos que entran con Google y aún no eligen rol
   const [needsRoleSelection, setNeedsRoleSelection] = useState(false);
   const [pendingGoogleUser, setPendingGoogleUser] = useState<any | null>(null);
   const [savingRole, setSavingRole] = useState(false);
@@ -80,6 +82,50 @@ export default function LoginScreen() {
     }
   };
 
+  const createProfileAndNavigate = async (
+    user: any,
+    chosenRole: "parent" | "babysitter",
+  ) => {
+    const fullName =
+      user.user_metadata?.full_name ||
+      user.user_metadata?.name ||
+      user.email?.split("@")[0] ||
+      "Usuario";
+
+    const { error: profileError } = await supabase.from("profiles").upsert(
+      {
+        id: user.id,
+        full_name: fullName,
+        role: chosenRole,
+        is_admin: false,
+      },
+      { onConflict: "id" },
+    );
+
+    if (profileError) throw profileError;
+
+    if (chosenRole === "parent") {
+      await supabase
+        .from("parent_profiles")
+        .upsert({ id: user.id }, { onConflict: "id", ignoreDuplicates: true });
+      navigateWithPendingRequest("/parent");
+    } else {
+      const nameParts = String(fullName).trim().split(/\s+/);
+      const firstName = nameParts[0] || "Niñera";
+      const lastName = nameParts.slice(1).join(" ") || "";
+
+      await supabase.from("babysitter_profiles").upsert(
+        {
+          id: user.id,
+          first_name: firstName,
+          last_name: lastName,
+        },
+        { onConflict: "id", ignoreDuplicates: true },
+      );
+      navigateWithPendingRequest("/babysitter");
+    }
+  };
+
   const routeAuthenticatedUser = async (user: any) => {
     if (!user || isRoutingRef.current) return;
     isRoutingRef.current = true;
@@ -96,24 +142,37 @@ export default function LoginScreen() {
       }
 
       if (profile?.is_admin) {
+        consumePendingGoogleRole();
         setIsAdminTester(true);
         setNeedsRoleSelection(false);
         return;
       }
 
       if (profile?.role === "babysitter") {
+        consumePendingGoogleRole();
         navigateWithPendingRequest("/babysitter");
         return;
       }
 
       if (profile?.role === "parent") {
+        consumePendingGoogleRole();
         navigateWithPendingRequest("/parent");
         return;
       }
 
-      // Usuario nuevo (ej. primer ingreso con Google sin rol asignado aún)
+      const preselectedRole = consumePendingGoogleRole();
+      if (preselectedRole) {
+        await createProfileAndNavigate(user, preselectedRole);
+        return;
+      }
+
       setPendingGoogleUser(user);
       setNeedsRoleSelection(true);
+    } catch (err: any) {
+      showAlert(
+        "Error al configurar perfil",
+        err?.message || "Intenta nuevamente.",
+      );
     } finally {
       setCheckingSession(false);
       isRoutingRef.current = false;
@@ -125,26 +184,87 @@ export default function LoginScreen() {
       savePendingRequestId(String(paramRequestId));
     }
 
-    // 1. Lectura directa de URL para Web/Vercel (recuperación de clave)
-    if (Platform.OS === "web" && typeof window !== "undefined") {
-      const urlInfo = window.location.hash || window.location.search;
-      if (urlInfo.includes("type=recovery")) {
-        setCheckingSession(false);
-        router.replace("/update-password");
-        return;
-      }
-    }
+    const initAuth = async () => {
+      if (Platform.OS === "web" && typeof window !== "undefined") {
+        const hash = window.location.hash || "";
+        const search = window.location.search || "";
+        const urlInfo = hash || search;
 
-    // 2. Verificar si ya existe sesión activa
-    supabase.auth.getSession().then(({ data: { session } }) => {
+        if (urlInfo.includes("type=recovery")) {
+          setCheckingSession(false);
+          router.replace("/update-password");
+          return;
+        }
+
+        if (hash.includes("id_token=") || hash.includes("error=")) {
+          const hashParams = new URLSearchParams(hash.replace(/^#/, ""));
+          const idToken = hashParams.get("id_token");
+          const oauthError = hashParams.get("error");
+
+          window.history.replaceState(
+            null,
+            "",
+            window.location.pathname + window.location.search,
+          );
+
+          if (oauthError) {
+            consumeGoogleRawNonce();
+            consumePendingGoogleRole();
+            if (oauthError !== "access_denied") {
+              showAlert(
+                "Error con Google",
+                `No se pudo iniciar (${oauthError}).`,
+              );
+            }
+            setCheckingSession(false);
+            return;
+          }
+
+          if (idToken) {
+            const rawNonce = consumeGoogleRawNonce();
+            try {
+              const { data, error } = await supabase.auth.signInWithIdToken({
+                provider: "google",
+                token: idToken,
+                ...(rawNonce ? { nonce: rawNonce } : {}),
+              });
+
+              if (error) {
+                consumePendingGoogleRole();
+                showAlert("Error con Google", error.message);
+                setCheckingSession(false);
+                return;
+              }
+
+              if (data?.user) {
+                await routeAuthenticatedUser(data.user);
+                return;
+              }
+            } catch (err: any) {
+              consumePendingGoogleRole();
+              showAlert(
+                "Error con Google",
+                err?.message || "No se pudo validar tu cuenta de Google.",
+              );
+              setCheckingSession(false);
+              return;
+            }
+          }
+        }
+      }
+
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
       if (session?.user) {
-        routeAuthenticatedUser(session.user);
+        await routeAuthenticatedUser(session.user);
       } else {
         setCheckingSession(false);
       }
-    });
+    };
 
-    // 3. Listener de Supabase
+    initAuth();
+
     const { data: authListener } = supabase.auth.onAuthStateChange(
       async (event, session) => {
         if (event === "PASSWORD_RECOVERY") {
@@ -197,47 +317,7 @@ export default function LoginScreen() {
     setSavingRole(true);
 
     try {
-      const fullName =
-        pendingGoogleUser.user_metadata?.full_name ||
-        pendingGoogleUser.user_metadata?.name ||
-        pendingGoogleUser.email?.split("@")[0] ||
-        "Usuario";
-
-      const { error: profileError } = await supabase.from("profiles").upsert(
-        {
-          id: pendingGoogleUser.id,
-          full_name: fullName,
-          role: chosenRole,
-          is_admin: false,
-        },
-        { onConflict: "id" },
-      );
-
-      if (profileError) throw profileError;
-
-      if (chosenRole === "parent") {
-        await supabase
-          .from("parent_profiles")
-          .upsert(
-            { id: pendingGoogleUser.id },
-            { onConflict: "id", ignoreDuplicates: true },
-          );
-        navigateWithPendingRequest("/parent");
-      } else {
-        const nameParts = String(fullName).trim().split(/\s+/);
-        const firstName = nameParts[0] || "Niñera";
-        const lastName = nameParts.slice(1).join(" ") || "";
-
-        await supabase.from("babysitter_profiles").upsert(
-          {
-            id: pendingGoogleUser.id,
-            first_name: firstName,
-            last_name: lastName,
-          },
-          { onConflict: "id", ignoreDuplicates: true },
-        );
-        navigateWithPendingRequest("/babysitter");
-      }
+      await createProfileAndNavigate(pendingGoogleUser, chosenRole);
     } catch (err: any) {
       showAlert("Error al configurar perfil", err.message);
     } finally {
@@ -396,10 +476,7 @@ export default function LoginScreen() {
                 <GoogleSignInButton
                   mode="signin"
                   disabled={loading}
-                  onSuccess={async (user) => {
-                    await routeAuthenticatedUser(user);
-                  }}
-                  onError={(msg) => showAlert("Error con Google", msg)}
+                  onError={(msg: string) => showAlert("Error con Google", msg)}
                 />
 
                 <View style={styles.dividerRow}>
@@ -500,7 +577,6 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   subtitle: { fontSize: 16, color: "#718096", marginBottom: 28 },
-
   dividerRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -517,7 +593,6 @@ const styles = StyleSheet.create({
     color: "#a0aec0",
     fontWeight: "500",
   },
-
   inputContainer: { marginBottom: 24 },
   label: { fontSize: 14, fontWeight: "600", color: "#4a5568", marginBottom: 8 },
   input: {
@@ -577,7 +652,6 @@ const styles = StyleSheet.create({
     marginBottom: 24,
     textAlign: "center",
   },
-
   roleSelectionBox: {
     width: "100%",
   },
