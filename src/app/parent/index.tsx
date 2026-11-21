@@ -23,6 +23,45 @@ const FILTER_ZONES = [
   "Vitacura",
 ];
 
+const PARENT_COMMUNES = [
+  "Las Condes",
+  "Providencia",
+  "Vitacura",
+  "Santiago Centro",
+  "Lo Barnechea",
+  "Ñuñoa",
+  "La Reina",
+  "Peñalolén",
+  "Otra",
+];
+
+const normalizeText = (text: string) =>
+  text
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+
+const detectCommuneFromAddress = (address?: string | null): string => {
+  const norm = normalizeText(String(address || ""));
+  if (!norm) return "";
+  for (const commune of PARENT_COMMUNES) {
+    if (commune === "Otra") continue;
+    if (norm.includes(normalizeText(commune))) {
+      return commune;
+    }
+  }
+  return "";
+};
+
+const formatAddressWithCommune = (rawAddress: string, commune: string) => {
+  const cleanAddr = rawAddress.trim().replace(/,\s*$/, "");
+  if (!commune || commune === "Otra") return cleanAddr;
+  if (normalizeText(cleanAddr).includes(normalizeText(commune))) {
+    return cleanAddr;
+  }
+  return cleanAddr ? `${cleanAddr}, ${commune}` : commune;
+};
+
 const AVAILABLE_TIMES = [
   "08:00",
   "08:30",
@@ -211,10 +250,12 @@ export default function ParentHomeScreen() {
     children_info: "",
     emergency_contact: "",
   });
+  const [selectedParentCommune, setSelectedParentCommune] =
+    useState<string>("");
   const [profileLoading, setProfileLoading] = useState(false);
   const [profileSaveSuccess, setProfileSaveSuccess] = useState(false);
 
-  // ESTADOS DEL GATEKEEPER JUST-IN-TIME (ÍTEM #22 FASE 1)
+  // ESTADOS DEL GATEKEEPER JUST-IN-TIME (ÍTEM #22 FASE 1 & 2)
   const [showOnboardingGateModal, setShowOnboardingGateModal] = useState(false);
   const [pendingSitterIdForGate, setPendingSitterIdForGate] = useState<
     string | null
@@ -225,7 +266,7 @@ export default function ParentHomeScreen() {
     setExpandedBreakdownIds((prev) => ({ ...prev, [id]: !prev[id] }));
   };
 
-  // NUEVO: ATERRIZAJE INTELIGENTE POR ?requestId=<ID> (ÍTEM #20 FASE 2)
+  // ATERRIZAJE INTELIGENTE POR ?requestId=<ID> (ÍTEM #20 FASE 2)
   useEffect(() => {
     if (!paramRequestId) return;
     const targetId = String(paramRequestId);
@@ -680,11 +721,17 @@ export default function ParentHomeScreen() {
       parentProfile.phone && parentProfile.phone.replace(/\D/g, "").length >= 8;
     const hasAddress =
       parentProfile.address && parentProfile.address.trim().length >= 5;
+    const hasCommune = Boolean(
+      selectedParentCommune || detectCommuneFromAddress(parentProfile.address),
+    );
     const hasChildrenInfo =
       parentProfile.children_info &&
       parentProfile.children_info.trim().length >= 2;
 
-    if (!hasPhone || !hasAddress || !hasChildrenInfo) {
+    if (!hasPhone || !hasAddress || !hasCommune || !hasChildrenInfo) {
+      if (!selectedParentCommune && selectedZone !== "Todas") {
+        setSelectedParentCommune(selectedZone);
+      }
       setPendingSitterIdForGate(babysitterId);
       setShowOnboardingGateModal(true);
       return;
@@ -702,10 +749,17 @@ export default function ParentHomeScreen() {
       );
       return;
     }
+    if (!selectedParentCommune) {
+      showAlert(
+        "Comuna requerida",
+        "Selecciona tu comuna para que la niñera pueda evaluar su traslado antes de aceptar.",
+      );
+      return;
+    }
     if (!parentProfile.address || parentProfile.address.trim().length < 5) {
       showAlert(
-        "Dirección y Comuna requeridas",
-        "Por favor indica tu dirección y comuna para que la niñera sepa dónde realizar el cuidado.",
+        "Dirección requerida",
+        "Por favor indica tu dirección exacta (solo se revelará cuando la reserva esté confirmada).",
       );
       return;
     }
@@ -727,10 +781,15 @@ export default function ParentHomeScreen() {
       } = await supabase.auth.getUser();
       if (!user) throw new Error("No hay sesión activa");
 
+      const finalAddress = formatAddressWithCommune(
+        parentProfile.address,
+        selectedParentCommune,
+      );
+
       const updates = {
         id: user.id,
         phone: parentProfile.phone.trim(),
-        address: parentProfile.address.trim(),
+        address: finalAddress,
         children_info: parentProfile.children_info.trim(),
         emergency_contact: (parentProfile.emergency_contact || "").trim(),
         updated_at: new Date(),
@@ -739,6 +798,7 @@ export default function ParentHomeScreen() {
       const { error } = await supabase.from("parent_profiles").upsert(updates);
       if (error) throw error;
 
+      setParentProfile((prev) => ({ ...prev, address: finalAddress }));
       setShowOnboardingGateModal(false);
       const targetSitterId = pendingSitterIdForGate || selectedSitter?.id;
       setPendingSitterIdForGate(null);
@@ -1010,12 +1070,14 @@ export default function ParentHomeScreen() {
         .maybeSingle();
       if (error && error.code !== "PGRST116") return;
       if (data) {
+        const loadedAddr = data.address || "";
         setParentProfile({
           phone: data.phone || "",
-          address: data.address || "",
+          address: loadedAddr,
           children_info: data.children_info || "",
           emergency_contact: data.emergency_contact || "",
         });
+        setSelectedParentCommune(detectCommuneFromAddress(loadedAddr));
       }
     } catch (error) {}
   };
@@ -1029,16 +1091,22 @@ export default function ParentHomeScreen() {
       } = await supabase.auth.getUser();
       if (!user) throw new Error("No hay sesión activa");
 
+      const finalAddress = formatAddressWithCommune(
+        parentProfile.address,
+        selectedParentCommune,
+      );
+
       const updates = {
         id: user.id,
-        phone: parentProfile.phone,
-        address: parentProfile.address,
-        children_info: parentProfile.children_info,
-        emergency_contact: parentProfile.emergency_contact,
+        phone: parentProfile.phone.trim(),
+        address: finalAddress,
+        children_info: parentProfile.children_info.trim(),
+        emergency_contact: parentProfile.emergency_contact.trim(),
         updated_at: new Date(),
       };
       const { error } = await supabase.from("parent_profiles").upsert(updates);
       if (error) throw error;
+      setParentProfile((prev) => ({ ...prev, address: finalAddress }));
       setProfileSaveSuccess(true);
       setTimeout(() => setProfileSaveSuccess(false), 3000);
     } catch (error: any) {
@@ -1621,6 +1689,10 @@ export default function ParentHomeScreen() {
                             {reqData?.job_date || "Pendiente"} •{" "}
                             {reqData?.job_time || ""})
                           </Text>
+                          <Text style={styles.pendingPrivacyHint}>
+                            🔒 Tu dirección exacta y teléfono permanecen ocultos
+                            hasta que {sitter.first_name} acepte el turno.
+                          </Text>
 
                           <TouchableOpacity
                             style={[
@@ -1890,10 +1962,19 @@ export default function ParentHomeScreen() {
           <View style={styles.contentArea}>
             <View style={styles.profileCard}>
               <Text style={styles.sectionTitle}>Tus Datos de Contacto</Text>
-              <Text style={styles.sectionSubtitle}>
-                Las niñeras verán esta información únicamente cuando acepten tu
-                solicitud.
-              </Text>
+
+              <View style={styles.privacyInfoBox}>
+                <Text style={styles.privacyInfoTitle}>
+                  🔒 Privacidad protegida
+                </Text>
+                <Text style={styles.privacyInfoText}>
+                  Antes de aceptar, la niñera solo ve tu{" "}
+                  <Text style={{ fontWeight: "bold" }}>comuna</Text>. Tu
+                  dirección exacta y WhatsApp se revelan únicamente cuando la
+                  reserva queda confirmada.
+                </Text>
+              </View>
+
               <Text style={styles.inputLabel}>Teléfono (WhatsApp)</Text>
               <TextInput
                 style={styles.input}
@@ -1904,15 +1985,47 @@ export default function ParentHomeScreen() {
                 }
                 keyboardType="phone-pad"
               />
-              <Text style={styles.inputLabel}>Dirección / Comuna</Text>
+
+              <Text style={styles.inputLabel}>
+                Comuna (visible al solicitar)
+              </Text>
+              <View style={styles.communeChipsContainer}>
+                {PARENT_COMMUNES.map((commune) => {
+                  const isSelected = selectedParentCommune === commune;
+                  return (
+                    <TouchableOpacity
+                      key={commune}
+                      style={[
+                        styles.communeChip,
+                        isSelected && styles.communeChipSelected,
+                      ]}
+                      onPress={() => setSelectedParentCommune(commune)}
+                    >
+                      <Text
+                        style={[
+                          styles.communeChipText,
+                          isSelected && styles.communeChipTextSelected,
+                        ]}
+                      >
+                        {commune}
+                      </Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </View>
+
+              <Text style={styles.inputLabel}>
+                Dirección exacta (protegida hasta confirmar)
+              </Text>
               <TextInput
                 style={styles.input}
-                placeholder="Ej: Av. Providencia 1234, Depto 501, Providencia"
+                placeholder="Ej: Av. Las Condes 9000, Depto 402"
                 value={parentProfile.address}
                 onChangeText={(text) =>
                   setParentProfile({ ...parentProfile, address: text })
                 }
               />
+
               <Text style={styles.inputLabel}>Información de los Niños</Text>
               <TextInput
                 style={[styles.input, styles.textArea]}
@@ -2175,7 +2288,7 @@ export default function ParentHomeScreen() {
         </Modal>
       )}
 
-      {/* MODAL GATEKEEPER JUST-IN-TIME DE DATOS MÍNIMOS (ÍTEM #22 FASE 1) */}
+      {/* MODAL GATEKEEPER JUST-IN-TIME DE DATOS MÍNIMOS (ÍTEM #22 FASE 1 & 2) */}
       {showOnboardingGateModal && (
         <Modal
           visible={showOnboardingGateModal}
@@ -2194,24 +2307,63 @@ export default function ParentHomeScreen() {
                     textAlign: "center",
                     color: "#4a5568",
                     fontSize: 14,
-                    marginBottom: 16,
+                    marginBottom: 12,
                     lineHeight: 20,
                   }}
                 >
-                  Para que{" "}
+                  Completa estos datos una sola vez para que{" "}
                   <Text style={{ fontWeight: "bold" }}>
                     {selectedSitter?.first_name || "la niñera"}
                   </Text>{" "}
-                  pueda evaluar su traslado y aceptar tu turno, completa estos
-                  datos una sola vez (quedarán guardados en tu perfil):
+                  evalúe su traslado y pueda confirmar tu turno:
                 </Text>
 
+                <View style={styles.privacyInfoBox}>
+                  <Text style={styles.privacyInfoTitle}>
+                    🔒 Tu privacidad está protegida
+                  </Text>
+                  <Text style={styles.privacyInfoText}>
+                    La niñera solo verá tu{" "}
+                    <Text style={{ fontWeight: "bold" }}>comuna</Text> antes de
+                    aceptar. Tu dirección exacta y WhatsApp se desbloquean
+                    únicamente al confirmarse la reserva.
+                  </Text>
+                </View>
+
                 <Text style={styles.inputLabel}>
-                  1. Dirección y Comuna del Cuidado *
+                  1. ¿En qué comuna es el cuidado? *
+                </Text>
+                <View style={styles.communeChipsContainer}>
+                  {PARENT_COMMUNES.map((commune) => {
+                    const isSelected = selectedParentCommune === commune;
+                    return (
+                      <TouchableOpacity
+                        key={commune}
+                        style={[
+                          styles.communeChip,
+                          isSelected && styles.communeChipSelected,
+                        ]}
+                        onPress={() => setSelectedParentCommune(commune)}
+                      >
+                        <Text
+                          style={[
+                            styles.communeChipText,
+                            isSelected && styles.communeChipTextSelected,
+                          ]}
+                        >
+                          {commune}
+                        </Text>
+                      </TouchableOpacity>
+                    );
+                  })}
+                </View>
+
+                <Text style={styles.inputLabel}>
+                  2. Dirección exacta (protegida hasta confirmar) *
                 </Text>
                 <TextInput
                   style={styles.input}
-                  placeholder="Ej: Av. Las Condes 9000, Depto 402, Las Condes"
+                  placeholder="Ej: Av. Las Condes 9000, Depto 402"
                   value={parentProfile.address}
                   onChangeText={(text) =>
                     setParentProfile({ ...parentProfile, address: text })
@@ -2219,7 +2371,7 @@ export default function ParentHomeScreen() {
                 />
 
                 <Text style={styles.inputLabel}>
-                  2. Tu Teléfono (WhatsApp) *
+                  3. Tu Teléfono (WhatsApp) *
                 </Text>
                 <TextInput
                   style={styles.input}
@@ -2232,7 +2384,7 @@ export default function ParentHomeScreen() {
                 />
 
                 <Text style={styles.inputLabel}>
-                  3. Niños a cuidar (Cantidad y edades) *
+                  4. Niños a cuidar (Cantidad y edades) *
                 </Text>
                 <TextInput
                   style={[styles.input, { height: 76 }]}
@@ -2245,7 +2397,7 @@ export default function ParentHomeScreen() {
                 />
 
                 <Text style={styles.inputLabel}>
-                  4. Contacto de Emergencia (Opcional)
+                  5. Contacto de Emergencia (Opcional)
                 </Text>
                 <TextInput
                   style={styles.input}
@@ -2620,6 +2772,60 @@ const styles = StyleSheet.create({
   filterChipText: { fontSize: 14, fontWeight: "600", color: "#4a5568" },
   filterChipTextSelected: { color: "#2b6cb0" },
 
+  communeChipsContainer: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+    marginBottom: 16,
+  },
+  communeChip: {
+    paddingVertical: 7,
+    paddingHorizontal: 12,
+    borderRadius: 18,
+    backgroundColor: "#edf2f7",
+    borderWidth: 1,
+    borderColor: "#cbd5e0",
+  },
+  communeChipSelected: {
+    backgroundColor: "#ebf8ff",
+    borderColor: "#3182ce",
+  },
+  communeChipText: {
+    fontSize: 13,
+    fontWeight: "600",
+    color: "#4a5568",
+  },
+  communeChipTextSelected: {
+    color: "#2b6cb0",
+  },
+
+  privacyInfoBox: {
+    backgroundColor: "#ebf8ff",
+    borderWidth: 1,
+    borderColor: "#bee3f8",
+    borderRadius: 8,
+    padding: 12,
+    marginBottom: 16,
+  },
+  privacyInfoTitle: {
+    fontSize: 13,
+    fontWeight: "bold",
+    color: "#2b6cb0",
+    marginBottom: 2,
+  },
+  privacyInfoText: {
+    fontSize: 12,
+    color: "#2c5282",
+    lineHeight: 17,
+  },
+  pendingPrivacyHint: {
+    fontSize: 12,
+    color: "#744210",
+    textAlign: "center",
+    marginBottom: 10,
+    lineHeight: 16,
+  },
+
   resultsSummary: {
     fontSize: 13,
     color: "#3182ce",
@@ -2755,7 +2961,7 @@ const styles = StyleSheet.create({
     color: "#c05621",
     fontWeight: "600",
     fontSize: 14,
-    marginBottom: 8,
+    marginBottom: 6,
     textAlign: "center",
   },
   cancelButton: {
@@ -3001,7 +3207,7 @@ const styles = StyleSheet.create({
     fontSize: 20,
     fontWeight: "bold",
     color: "#2d3748",
-    marginBottom: 6,
+    marginBottom: 12,
   },
   sectionSubtitle: { fontSize: 14, color: "#718096", marginBottom: 24 },
   inputLabel: {
