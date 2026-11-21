@@ -15,6 +15,8 @@ import {
   View,
 } from "react-native";
 
+const PLATFORM_COMMISSION_RATE = 0.3;
+
 const showAlert = (title: string, message: string) => {
   if (Platform.OS === "web") {
     alert(title + ": " + message);
@@ -23,10 +25,39 @@ const showAlert = (title: string, message: string) => {
   }
 };
 
+const confirmAction = (
+  title: string,
+  message: string,
+  onConfirm: () => void,
+  confirmLabel = "Confirmar",
+  isDestructive = false,
+) => {
+  if (Platform.OS === "web") {
+    if (typeof window !== "undefined") {
+      const ok = window.confirm(`${title}\n\n${message}`);
+      if (ok) onConfirm();
+    }
+    return;
+  }
+
+  Alert.alert(title, message, [
+    { text: "Cancelar", style: "cancel" },
+    {
+      text: confirmLabel,
+      style: isDestructive ? "destructive" : "default",
+      onPress: onConfirm,
+    },
+  ]);
+};
+
 const formatCLP = (amount: number) => {
   return (
     "$" + new Intl.NumberFormat("es-CL").format(Math.round(amount)) + " CLP"
   );
+};
+
+const formatCLPCompact = (amount: number) => {
+  return "$" + new Intl.NumberFormat("es-CL").format(Math.round(amount));
 };
 
 const formatMsgTime = (iso?: string) => {
@@ -44,6 +75,100 @@ const formatMsgTime = (iso?: string) => {
 
 const stripSupportPrefix = (content?: string) => {
   return String(content || "").replace(/^\[Soporte[^\]]*\]:\s*/i, "");
+};
+
+const getRequestFinancials = (req: any) => {
+  const total = Number(req.total_amount) || 0;
+  const fee =
+    Number(req.platform_fee) || Math.round(total * PLATFORM_COMMISSION_RATE);
+  const payout = Number(req.babysitter_payout) || Math.max(0, total - fee);
+  return { total, fee, payout };
+};
+
+const parseJobWindow = (jobDate?: string, jobTime?: string) => {
+  let jobDateStr = String(jobDate || "").trim();
+  const slashMatch = jobDateStr.match(/(\d{2})\/(\d{2})\/(\d{4})/);
+  if (slashMatch) {
+    jobDateStr = `${slashMatch[3]}-${slashMatch[2]}-${slashMatch[1]}`;
+  }
+
+  const timeParts = String(jobTime || "09:00 - 11:00")
+    .split("-")
+    .map((s) => s.trim());
+  const startTime = timeParts[0] || "09:00";
+  const endTime = timeParts[1] || "";
+
+  const startDate = new Date(`${jobDateStr}T${startTime}:00`);
+  const isValidStart = !isNaN(startDate.getTime());
+
+  let endDate: Date | null = null;
+  if (isValidStart && endTime) {
+    const parsedEnd = new Date(`${jobDateStr}T${endTime}:00`);
+    if (!isNaN(parsedEnd.getTime())) {
+      endDate = parsedEnd;
+    }
+  }
+  if (isValidStart && !endDate) {
+    endDate = new Date(startDate.getTime() + 2 * 60 * 60 * 1000);
+  }
+
+  return { startDate, endDate, isValidStart };
+};
+
+const evaluateEscrowState = (req: any) => {
+  const now = new Date();
+  const { startDate, endDate, isValidStart } = parseJobWindow(
+    req.job_date,
+    req.job_time,
+  );
+
+  if (!isValidStart) {
+    return {
+      priority: 3,
+      label: "🟢 Agendado",
+      color: "#22543d",
+      bg: "#c6f6d5",
+      borderColor: "#cbd5e0",
+      sortTime: Number.MAX_SAFE_INTEGER,
+    };
+  }
+
+  const diffHoursToStart =
+    (startDate.getTime() - now.getTime()) / (1000 * 60 * 60);
+  const hasEnded = endDate
+    ? now.getTime() > endDate.getTime()
+    : diffHoursToStart < -2;
+
+  if (hasEnded) {
+    return {
+      priority: 1,
+      label: "🔵 Por cerrar",
+      color: "#234e52",
+      bg: "#b2f5ea",
+      borderColor: "#319795",
+      sortTime: startDate.getTime(),
+    };
+  }
+
+  if (diffHoursToStart < 2) {
+    return {
+      priority: 2,
+      label: "🟡 En curso / Inminente",
+      color: "#975a16",
+      bg: "#fefcbf",
+      borderColor: "#d69e2e",
+      sortTime: startDate.getTime(),
+    };
+  }
+
+  return {
+    priority: 3,
+    label: "🟢 Agendado",
+    color: "#22543d",
+    bg: "#c6f6d5",
+    borderColor: "#cbd5e0",
+    sortTime: startDate.getTime(),
+  };
 };
 
 const getConciergeTemplates = (req: any) => {
@@ -81,21 +206,13 @@ const getConciergeTemplates = (req: any) => {
 // -----------------------------------------------------------------------------
 const evaluateJobAlert = (req: any) => {
   const now = new Date();
-
-  let jobDateStr = req.job_date;
-  if (jobDateStr && jobDateStr.includes("/")) {
-    const parts = jobDateStr.split("/");
-    if (parts.length === 3) {
-      const dayToken = parts[0].trim().split(" ").pop() || parts[0].trim();
-      jobDateStr = `${parts[2]}-${parts[1]}-${dayToken}`;
-    }
-  }
-
-  // Extraer la hora de inicio (ej: "20:00 - 22:00" -> "20:00")
-  const rawTime = req.job_time ? req.job_time.split("-")[0].trim() : "09:00";
-  const jobStartStr = `${jobDateStr}T${rawTime}:00`;
-  const jobStart = new Date(jobStartStr);
-  const diffHours = (jobStart.getTime() - now.getTime()) / (1000 * 60 * 60);
+  const { startDate, isValidStart } = parseJobWindow(
+    req.job_date,
+    req.job_time,
+  );
+  const diffHours = isValidStart
+    ? (startDate.getTime() - now.getTime()) / (1000 * 60 * 60)
+    : 999;
 
   // Si la fecha y hora del turno ya quedaron en el pasado y sigue pendiente, lo filtramos
   if (req.status === "pending" && diffHours < -1) {
@@ -205,6 +322,9 @@ export default function AdminDashboardScreen() {
   const [expandedBreakdownIds, setExpandedBreakdownIds] = useState<{
     [key: string]: boolean;
   }>({});
+
+  // DETALLE INTERACTIVO DE ESCROW ACTIVO (ÍTEM #27)
+  const [showEscrowDetail, setShowEscrowDetail] = useState(false);
 
   // ESTADOS DEL CHAT OPERATIVO DE SOPORTE (ÍTEM #26)
   const [isChatOpen, setIsChatOpen] = useState(false);
@@ -418,6 +538,35 @@ export default function AdminDashboardScreen() {
     }
   };
 
+  const notifyParticipants = async (
+    req: any,
+    parentNotif: { title: string; message: string },
+    sitterNotif: { title: string; message: string },
+  ) => {
+    try {
+      const rows: { user_id: string; title: string; message: string }[] = [];
+      if (req.parent_id) {
+        rows.push({
+          user_id: req.parent_id,
+          title: parentNotif.title,
+          message: parentNotif.message,
+        });
+      }
+      if (req.babysitter_id && req.babysitter_id !== req.parent_id) {
+        rows.push({
+          user_id: req.babysitter_id,
+          title: sitterNotif.title,
+          message: sitterNotif.message,
+        });
+      }
+      if (rows.length > 0) {
+        await supabase.from("notifications").insert(rows);
+      }
+    } catch (err) {
+      console.error("Error enviando notificaciones administrativas:", err);
+    }
+  };
+
   const fetchAdminData = async () => {
     setLoading(true);
     try {
@@ -531,36 +680,124 @@ export default function AdminDashboardScreen() {
     }
   };
 
-  const handleForceCompletion = async (requestId: string) => {
-    setUpdatingId(requestId);
+  const executeForceCompletion = async (req: any) => {
+    setUpdatingId(req.id);
     try {
       const { error } = await supabase
         .from("job_requests")
         .update({ status: "completed", payment_status: "ready_for_payout" })
-        .eq("id", requestId);
+        .eq("id", req.id);
 
       if (error) throw error;
 
       setRequests((prev) =>
-        prev.map((req) =>
-          req.id === requestId
+        prev.map((item) =>
+          item.id === req.id
             ? {
-                ...req,
+                ...item,
                 status: "completed",
                 payment_status: "ready_for_payout",
               }
-            : req,
+            : item,
         ),
       );
+
+      const { payout } = getRequestFinancials(req);
+      await notifyParticipants(
+        req,
+        {
+          title: "✅ Servicio Cerrado por Soporte",
+          message: `Tu turno del ${req.job_date || ""} fue cerrado y el pago pasó a liquidación. ¡Ya puedes calificar en tu historial!`,
+        },
+        {
+          title: "💰 Turno Cerrado — Pago en Proceso",
+          message: `Soporte cerró el turno del ${req.job_date || ""}. Tu pago líquido de ${formatCLP(payout)} pasó a Liquidaciones Pendientes.`,
+        },
+      );
+
       showAlert(
         "Servicio Cerrado",
-        "Se marcó como completado y el dinero pasó a Payout.",
+        "Se marcó como completado y el dinero pasó a Liquidaciones Pendientes (Payouts).",
       );
     } catch (error: any) {
       showAlert("Error", error.message);
     } finally {
       setUpdatingId(null);
     }
+  };
+
+  const handleForceCompletion = (req: any) => {
+    const parentName = req.parent?.parent_name || "Familia";
+    const sitterName = req.babysitter?.first_name || "Niñera";
+    const { payout } = getRequestFinancials(req);
+
+    confirmAction(
+      "Cerrar turno y pasar a Payout",
+      `¿Confirmas marcar como completado el turno del ${req.job_date || ""} (${parentName} ↔ ${sitterName}) y liberar ${formatCLP(payout)} a Liquidaciones Pendientes?`,
+      () => executeForceCompletion(req),
+      "Pasar a Payout",
+      false,
+    );
+  };
+
+  const executeRefundEscrow = async (req: any) => {
+    setUpdatingId(req.id);
+    try {
+      const { error } = await supabase
+        .from("job_requests")
+        .update({ status: "rejected", payment_status: "refunded" })
+        .eq("id", req.id);
+
+      if (error) throw error;
+
+      setRequests((prev) =>
+        prev.map((item) =>
+          item.id === req.id
+            ? {
+                ...item,
+                status: "rejected",
+                payment_status: "refunded",
+              }
+            : item,
+        ),
+      );
+
+      const { total } = getRequestFinancials(req);
+      await notifyParticipants(
+        req,
+        {
+          title: "↩️ Reserva Cancelada y Reembolsada",
+          message: `Soporte MiBabysitter canceló el turno del ${req.job_date || ""} y registró el reembolso de ${formatCLP(total)}.`,
+        },
+        {
+          title: "↩️ Turno Cancelado por Soporte",
+          message: `Soporte MiBabysitter canceló el turno del ${req.job_date || ""} y liberó el reembolso a la familia.`,
+        },
+      );
+
+      showAlert(
+        "Reembolso Registrado",
+        "La reserva fue cancelada y marcada como reembolsada.",
+      );
+    } catch (error: any) {
+      showAlert("Error al reembolsar", error.message);
+    } finally {
+      setUpdatingId(null);
+    }
+  };
+
+  const handleRefundEscrow = (req: any) => {
+    const parentName = req.parent?.parent_name || "Familia";
+    const sitterName = req.babysitter?.first_name || "Niñera";
+    const { total } = getRequestFinancials(req);
+
+    confirmAction(
+      "Cancelar y Reembolsar Escrow",
+      `¿Seguro que deseas cancelar el turno del ${req.job_date || ""} (${parentName} ↔ ${sitterName}) y marcar ${formatCLP(total)} como reembolsado? Esta acción notificará a ambas partes.`,
+      () => executeRefundEscrow(req),
+      "Sí, reembolsar",
+      true,
+    );
   };
 
   const openWhatsApp = (phone: string, message: string) => {
@@ -743,7 +980,7 @@ export default function AdminDashboardScreen() {
         return (
           <TouchableOpacity
             style={styles.actionBtnTeal}
-            onPress={() => handleForceCompletion(req.id)}
+            onPress={() => handleForceCompletion(req)}
             disabled={updatingId === req.id}
           >
             {updatingId === req.id ? (
@@ -780,14 +1017,48 @@ export default function AdminDashboardScreen() {
   });
 
   const completedRequests = requests.filter((r) => r.status === "completed");
-  const upcomingRequests = requests.filter((r) => r.status === "accepted");
+
+  // CONTABILIDAD LIMPIA (#27): Escrow estricto (accepted + held) sin duplicar unpaid
+  const unpaidAcceptedRequests = requests.filter(
+    (r) => r.status === "accepted" && r.payment_status === "unpaid",
+  );
+  const unpaidAcceptedTotal = unpaidAcceptedRequests.reduce(
+    (sum, r) => sum + (Number(r.total_amount) || 0),
+    0,
+  );
+
+  const escrowItems = requests
+    .filter((r) => r.status === "accepted" && r.payment_status === "held")
+    .map((req) => ({
+      req,
+      escrowState: evaluateEscrowState(req),
+      financials: getRequestFinancials(req),
+    }))
+    .sort((a, b) => {
+      if (a.escrowState.priority !== b.escrowState.priority) {
+        return a.escrowState.priority - b.escrowState.priority;
+      }
+      return a.escrowState.sortTime - b.escrowState.sortTime;
+    });
+
+  const escrowTotal = escrowItems.reduce(
+    (sum, item) => sum + item.financials.total,
+    0,
+  );
+  const escrowBabysitterTotal = escrowItems.reduce(
+    (sum, item) => sum + item.financials.payout,
+    0,
+  );
+  const escrowPlatformTotal = escrowItems.reduce(
+    (sum, item) => sum + item.financials.fee,
+    0,
+  );
+  const escrowNeedsCloseCount = escrowItems.filter(
+    (item) => item.escrowState.priority === 1,
+  ).length;
 
   const revenue = completedRequests.reduce(
     (sum, r) => sum + (Number(r.platform_fee) || 0),
-    0,
-  );
-  const escrow = upcomingRequests.reduce(
-    (sum, r) => sum + (Number(r.total_amount) || 0),
     0,
   );
   const pendingPayouts = completedRequests
@@ -944,31 +1215,52 @@ export default function AdminDashboardScreen() {
                   <View style={styles.financeBox}>
                     <Text style={styles.financeLabel}>Por Cobrar a Padres</Text>
                     <Text style={styles.financeValue}>
-                      {formatCLP(
-                        requests
-                          .filter(
-                            (r) =>
-                              r.status === "accepted" &&
-                              r.payment_status === "unpaid",
-                          )
-                          .reduce(
-                            (s, r) => s + (Number(r.total_amount) || 0),
-                            0,
-                          ),
-                      )}
+                      {formatCLP(unpaidAcceptedTotal)}
+                    </Text>
+                    <Text style={styles.financeMicroNote}>
+                      {unpaidAcceptedRequests.length}{" "}
+                      {unpaidAcceptedRequests.length === 1
+                        ? "reserva sin pago"
+                        : "reservas sin pago"}
                     </Text>
                   </View>
-                  <View
+
+                  {/* KPI INTERACTIVO: ESCROW ACTIVO (#27) */}
+                  <TouchableOpacity
+                    activeOpacity={0.8}
+                    onPress={() => setShowEscrowDetail((prev) => !prev)}
                     style={[
                       styles.financeBox,
-                      { backgroundColor: "#fffaf0", borderColor: "#feebc8" },
+                      styles.escrowKpiBox,
+                      showEscrowDetail && styles.escrowKpiBoxExpanded,
                     ]}
                   >
-                    <Text style={styles.financeLabel}>Escrow Activo</Text>
+                    <View style={styles.escrowKpiHeaderRow}>
+                      <Text style={styles.financeLabel}>Escrow Activo</Text>
+                      <Text style={styles.escrowToggleHint}>
+                        {showEscrowDetail ? "Ocultar ▲" : "Detalle ▼"}
+                      </Text>
+                    </View>
                     <Text style={[styles.financeValue, { color: "#c05621" }]}>
-                      {formatCLP(escrow)}
+                      {formatCLP(escrowTotal)}
                     </Text>
-                  </View>
+                    <Text style={styles.escrowCountNote}>
+                      🔒 {escrowItems.length}{" "}
+                      {escrowItems.length === 1
+                        ? "turno retenido"
+                        : "turnos retenidos"}
+                      {escrowNeedsCloseCount > 0
+                        ? ` (${escrowNeedsCloseCount} por cerrar)`
+                        : ""}
+                    </Text>
+                    {escrowTotal > 0 && (
+                      <Text style={styles.escrowSplitNote}>
+                        Niñeras: {formatCLPCompact(escrowBabysitterTotal)} •
+                        App: {formatCLPCompact(escrowPlatformTotal)}
+                      </Text>
+                    )}
+                  </TouchableOpacity>
+
                   <View
                     style={[
                       styles.financeBox,
@@ -993,6 +1285,196 @@ export default function AdminDashboardScreen() {
                   </View>
                 </View>
 
+                {/* SECCIÓN DESPLEGABLE: DETALLE DE FONDOS EN ESCROW (#27) */}
+                {showEscrowDetail && (
+                  <View style={styles.escrowSectionContainer}>
+                    <View style={styles.escrowSectionHeader}>
+                      <Text style={styles.escrowSectionTitle}>
+                        🔒 Detalle de Fondos en Escrow ({escrowItems.length})
+                      </Text>
+                      <TouchableOpacity
+                        onPress={() => setShowEscrowDetail(false)}
+                      >
+                        <Text style={styles.escrowCloseLink}>Ocultar ▲</Text>
+                      </TouchableOpacity>
+                    </View>
+
+                    {escrowItems.length > 0 && (
+                      <View style={styles.escrowSummaryBar}>
+                        <Text style={styles.escrowSummaryText}>
+                          Pasivo Niñeras (70%):{" "}
+                          <Text
+                            style={{ fontWeight: "bold", color: "#2b6cb0" }}
+                          >
+                            {formatCLP(escrowBabysitterTotal)}
+                          </Text>
+                        </Text>
+                        <Text style={styles.escrowSummaryText}>
+                          Comisión Proyectada (30%):{" "}
+                          <Text
+                            style={{ fontWeight: "bold", color: "#2f855a" }}
+                          >
+                            {formatCLP(escrowPlatformTotal)}
+                          </Text>
+                        </Text>
+                      </View>
+                    )}
+
+                    {escrowItems.length === 0 ? (
+                      <Text style={styles.emptyText}>
+                        No hay fondos retenidos en Escrow actualmente.
+                      </Text>
+                    ) : (
+                      escrowItems.map(({ req, escrowState, financials }) => {
+                        const parentName = req.parent?.parent_name || "Familia";
+                        const sitterFirst =
+                          req.babysitter?.first_name || "Niñera";
+                        const sitterLast = req.babysitter?.last_name || "";
+                        const sitterName =
+                          `${sitterFirst} ${sitterLast}`.trim();
+                        const msgCount = msgCountsMap[req.id] || 0;
+                        const isBusy = updatingId === req.id;
+
+                        return (
+                          <View
+                            key={req.id}
+                            style={[
+                              styles.escrowCard,
+                              { borderLeftColor: escrowState.borderColor },
+                            ]}
+                          >
+                            <View style={styles.escrowCardTopRow}>
+                              <View
+                                style={[
+                                  styles.escrowStatePill,
+                                  { backgroundColor: escrowState.bg },
+                                ]}
+                              >
+                                <Text
+                                  style={[
+                                    styles.escrowStatePillText,
+                                    { color: escrowState.color },
+                                  ]}
+                                >
+                                  {escrowState.label}
+                                </Text>
+                              </View>
+                              <Text style={styles.escrowShiftText}>
+                                📅 {req.job_date || "Sin fecha"} • ⏰{" "}
+                                {req.job_time || "Sin hora"}
+                              </Text>
+                            </View>
+
+                            <Text style={styles.escrowActorsText}>
+                              👨‍👩‍👧{" "}
+                              <Text style={{ fontWeight: "bold" }}>
+                                {parentName}
+                              </Text>{" "}
+                              ↔ 👩‍🍼{" "}
+                              <Text style={{ fontWeight: "bold" }}>
+                                {sitterName}
+                              </Text>
+                            </Text>
+                            <Text
+                              style={styles.escrowAddressText}
+                              numberOfLines={1}
+                            >
+                              📍{" "}
+                              {req.parent?.address || "Dirección sin registro"}
+                            </Text>
+
+                            <View style={styles.escrowMoneyGrid}>
+                              <View style={styles.escrowMoneyCell}>
+                                <Text style={styles.escrowMoneyLabel}>
+                                  Retenido (100%)
+                                </Text>
+                                <Text
+                                  style={[
+                                    styles.escrowMoneyValue,
+                                    { color: "#c05621" },
+                                  ]}
+                                >
+                                  {formatCLPCompact(financials.total)}
+                                </Text>
+                              </View>
+                              <View style={styles.escrowMoneyDivider} />
+                              <View style={styles.escrowMoneyCell}>
+                                <Text style={styles.escrowMoneyLabel}>
+                                  Niñera (70%)
+                                </Text>
+                                <Text
+                                  style={[
+                                    styles.escrowMoneyValue,
+                                    { color: "#2b6cb0" },
+                                  ]}
+                                >
+                                  {formatCLPCompact(financials.payout)}
+                                </Text>
+                              </View>
+                              <View style={styles.escrowMoneyDivider} />
+                              <View style={styles.escrowMoneyCell}>
+                                <Text style={styles.escrowMoneyLabel}>
+                                  Comisión (30%)
+                                </Text>
+                                <Text
+                                  style={[
+                                    styles.escrowMoneyValue,
+                                    { color: "#2f855a" },
+                                  ]}
+                                >
+                                  {formatCLPCompact(financials.fee)}
+                                </Text>
+                              </View>
+                            </View>
+
+                            <View style={styles.escrowActionsWrap}>
+                              <TouchableOpacity
+                                style={styles.actionBtnPurple}
+                                onPress={() => handleOpenAdminChat(req)}
+                                disabled={isBusy}
+                              >
+                                <Text style={styles.actionBtnText}>
+                                  💬 Chat Operativo ({msgCount}{" "}
+                                  {msgCount === 1 ? "msg" : "msgs"})
+                                </Text>
+                              </TouchableOpacity>
+
+                              <View style={styles.escrowSecondaryActionsRow}>
+                                <TouchableOpacity
+                                  style={[styles.actionBtnTeal, { flex: 1.4 }]}
+                                  onPress={() => handleForceCompletion(req)}
+                                  disabled={isBusy}
+                                >
+                                  {isBusy ? (
+                                    <ActivityIndicator
+                                      color="#fff"
+                                      size="small"
+                                    />
+                                  ) : (
+                                    <Text style={styles.actionBtnText}>
+                                      ✅ Pasar a Payout
+                                    </Text>
+                                  )}
+                                </TouchableOpacity>
+
+                                <TouchableOpacity
+                                  style={[styles.refundBtnOutline, { flex: 1 }]}
+                                  onPress={() => handleRefundEscrow(req)}
+                                  disabled={isBusy}
+                                >
+                                  <Text style={styles.refundBtnOutlineText}>
+                                    ↩️ Reembolsar
+                                  </Text>
+                                </TouchableOpacity>
+                              </View>
+                            </View>
+                          </View>
+                        );
+                      })
+                    )}
+                  </View>
+                )}
+
                 <Text style={styles.sectionTitle}>
                   Liquidaciones Pendientes (Payouts)
                 </Text>
@@ -1009,9 +1491,11 @@ export default function AdminDashboardScreen() {
                       const isHistExpanded = Boolean(
                         expandedBreakdownIds["admin_payout_" + req.id],
                       );
-                      const totalAmt = Number(req.total_amount) || 0;
-                      const feeAmt = Number(req.platform_fee) || 0;
-                      const payoutAmt = Number(req.babysitter_payout) || 0;
+                      const {
+                        total: totalAmt,
+                        fee: feeAmt,
+                        payout: payoutAmt,
+                      } = getRequestFinancials(req);
 
                       return (
                         <View key={req.id} style={styles.payoutCard}>
@@ -1500,24 +1984,194 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     flexWrap: "wrap",
     justifyContent: "space-between",
-    marginBottom: 24,
+    marginBottom: 16,
   },
   financeBox: {
     width: "48%",
     backgroundColor: "#fff",
-    padding: 16,
+    padding: 14,
     borderRadius: 12,
     borderWidth: 1,
     borderColor: "#e2e8f0",
-    marginBottom: 16,
+    marginBottom: 14,
   },
   financeLabel: {
     fontSize: 13,
     color: "#718096",
-    marginBottom: 8,
+    marginBottom: 6,
     fontWeight: "600",
   },
-  financeValue: { fontSize: 20, fontWeight: "bold", color: "#2d3748" },
+  financeValue: { fontSize: 19, fontWeight: "bold", color: "#2d3748" },
+  financeMicroNote: {
+    fontSize: 11,
+    color: "#718096",
+    marginTop: 6,
+  },
+
+  // ESTILOS DE ESCROW INTERACTIVO Y DETALLE (#27)
+  escrowKpiBox: {
+    backgroundColor: "#fffaf0",
+    borderColor: "#fbd38d",
+    borderWidth: 1.5,
+  },
+  escrowKpiBoxExpanded: {
+    borderColor: "#d69e2e",
+    borderWidth: 2,
+    backgroundColor: "#fffff0",
+  },
+  escrowKpiHeaderRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    gap: 4,
+  },
+  escrowToggleHint: {
+    fontSize: 11,
+    fontWeight: "bold",
+    color: "#c05621",
+    marginBottom: 6,
+  },
+  escrowCountNote: {
+    fontSize: 11,
+    fontWeight: "600",
+    color: "#9c4221",
+    marginTop: 6,
+  },
+  escrowSplitNote: {
+    fontSize: 10.5,
+    color: "#744210",
+    marginTop: 3,
+  },
+  escrowSectionContainer: {
+    width: "100%",
+    backgroundColor: "#fffaf0",
+    borderWidth: 1,
+    borderColor: "#fbd38d",
+    borderRadius: 12,
+    padding: 14,
+    marginBottom: 24,
+  },
+  escrowSectionHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 10,
+  },
+  escrowSectionTitle: {
+    fontSize: 16,
+    fontWeight: "bold",
+    color: "#9c4221",
+  },
+  escrowCloseLink: {
+    fontSize: 12,
+    fontWeight: "bold",
+    color: "#c05621",
+  },
+  escrowSummaryBar: {
+    backgroundColor: "#ffffff",
+    borderWidth: 1,
+    borderColor: "#feebc8",
+    borderRadius: 8,
+    padding: 10,
+    marginBottom: 12,
+    gap: 4,
+  },
+  escrowSummaryText: {
+    fontSize: 12.5,
+    color: "#4a5568",
+  },
+  escrowCard: {
+    backgroundColor: "#ffffff",
+    borderRadius: 10,
+    padding: 14,
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+    borderLeftWidth: 4,
+  },
+  escrowCardTopRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    flexWrap: "wrap",
+    gap: 6,
+    marginBottom: 8,
+  },
+  escrowStatePill: {
+    paddingVertical: 3,
+    paddingHorizontal: 9,
+    borderRadius: 10,
+  },
+  escrowStatePillText: {
+    fontSize: 11,
+    fontWeight: "bold",
+  },
+  escrowShiftText: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: "#4a5568",
+  },
+  escrowActorsText: {
+    fontSize: 14,
+    color: "#2d3748",
+    marginBottom: 3,
+  },
+  escrowAddressText: {
+    fontSize: 12,
+    color: "#718096",
+    marginBottom: 10,
+  },
+  escrowMoneyGrid: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#f8fafc",
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+    borderRadius: 8,
+    paddingVertical: 8,
+    paddingHorizontal: 6,
+    marginBottom: 10,
+  },
+  escrowMoneyCell: {
+    flex: 1,
+    alignItems: "center",
+  },
+  escrowMoneyDivider: {
+    width: 1,
+    height: 26,
+    backgroundColor: "#e2e8f0",
+  },
+  escrowMoneyLabel: {
+    fontSize: 10.5,
+    color: "#718096",
+    marginBottom: 2,
+    fontWeight: "600",
+  },
+  escrowMoneyValue: {
+    fontSize: 13.5,
+    fontWeight: "bold",
+  },
+  escrowActionsWrap: {
+    gap: 8,
+  },
+  escrowSecondaryActionsRow: {
+    flexDirection: "row",
+    gap: 8,
+  },
+  refundBtnOutline: {
+    backgroundColor: "#fff5f5",
+    borderWidth: 1,
+    borderColor: "#feb2b2",
+    paddingVertical: 10,
+    borderRadius: 8,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  refundBtnOutlineText: {
+    color: "#c53030",
+    fontWeight: "bold",
+    fontSize: 13,
+  },
 
   sectionTitle: {
     fontSize: 18,
