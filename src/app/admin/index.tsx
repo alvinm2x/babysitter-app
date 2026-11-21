@@ -29,6 +29,53 @@ const formatCLP = (amount: number) => {
   );
 };
 
+const formatMsgTime = (iso?: string) => {
+  if (!iso) return "";
+  try {
+    return new Date(iso).toLocaleTimeString("es-CL", {
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    });
+  } catch {
+    return "";
+  }
+};
+
+const stripSupportPrefix = (content?: string) => {
+  return String(content || "").replace(/^\[Soporte[^\]]*\]:\s*/i, "");
+};
+
+const getConciergeTemplates = (req: any) => {
+  const parentName = req?.parent?.parent_name || "Familia";
+  const sitterName = req?.babysitter?.first_name || "la niñera";
+  const jobDate = req?.job_date || "la fecha agendada";
+  const jobTime = req?.job_time || "el horario acordado";
+
+  return [
+    {
+      id: "checkin",
+      label: "👋 Check-in",
+      text: `Hola, les escribimos desde Soporte MiBabysitter. Confirmamos que su turno del ${jobDate} (${jobTime}) sigue en pie. ¿Todo coordinado por ambos lados?`,
+    },
+    {
+      id: "nudge",
+      label: "⚡ Destrabar",
+      text: `Hola ${sitterName}, desde Soporte MiBabysitter vemos que la familia de ${parentName} espera respuesta para el ${jobDate} (${jobTime}). ¿Podrás tomar este turno?`,
+    },
+    {
+      id: "payment",
+      label: "💳 Pago",
+      text: `Hola ${parentName}, te escribimos desde Soporte MiBabysitter. Tu turno del ${jobDate} con ${sitterName} ya está aceptado; recuerda confirmar el pago protegido para liberar los datos de contacto.`,
+    },
+    {
+      id: "close",
+      label: "✅ Cierre",
+      text: `Hola, desde Soporte MiBabysitter vemos que el horario del turno (${jobTime}) ya finalizó. Recuerden marcar el servicio como completado para liberar el pago protegido.`,
+    },
+  ];
+};
+
 // -----------------------------------------------------------------------------
 // MOTOR DETERMINISTA DE ALERTAS (FASE 1 & FASE 3: LIMPIEZA DE VENCIDOS)
 // -----------------------------------------------------------------------------
@@ -38,7 +85,10 @@ const evaluateJobAlert = (req: any) => {
   let jobDateStr = req.job_date;
   if (jobDateStr && jobDateStr.includes("/")) {
     const parts = jobDateStr.split("/");
-    if (parts.length === 3) jobDateStr = `${parts[2]}-${parts[1]}-${parts[0]}`;
+    if (parts.length === 3) {
+      const dayToken = parts[0].trim().split(" ").pop() || parts[0].trim();
+      jobDateStr = `${parts[2]}-${parts[1]}-${dayToken}`;
+    }
   }
 
   // Extraer la hora de inicio (ej: "20:00 - 22:00" -> "20:00")
@@ -144,6 +194,9 @@ export default function AdminDashboardScreen() {
   const [activeTab, setActiveTab] = useState<"alerts" | "finance">("alerts");
   const [loading, setLoading] = useState(true);
   const [requests, setRequests] = useState<any[]>([]);
+  const [msgCountsMap, setMsgCountsMap] = useState<{ [key: string]: number }>(
+    {},
+  );
   const [updatingId, setUpdatingId] = useState<string | null>(null);
   const [emailStatusMap, setEmailStatusMap] = useState<{
     [key: string]: string;
@@ -153,13 +206,15 @@ export default function AdminDashboardScreen() {
     [key: string]: boolean;
   }>({});
 
-  // NUEVO: ESTADOS DEL CHAT OPERATIVO DE SOPORTE (ÍTEM #26 FASE 1)
+  // ESTADOS DEL CHAT OPERATIVO DE SOPORTE (ÍTEM #26)
   const [isChatOpen, setIsChatOpen] = useState(false);
   const [activeChatReq, setActiveChatReq] = useState<any | null>(null);
   const [messages, setMessages] = useState<any[]>([]);
   const [newMessage, setNewMessage] = useState("");
+  const [notifyTarget, setNotifyTarget] = useState<
+    "both" | "parent" | "babysitter"
+  >("both");
   const [sendingMessage, setSendingMessage] = useState(false);
-  const [adminUserId, setAdminUserId] = useState<string | null>(null);
 
   const toggleBreakdown = (id: string) => {
     setExpandedBreakdownIds((prev) => ({ ...prev, [id]: !prev[id] }));
@@ -167,9 +222,6 @@ export default function AdminDashboardScreen() {
 
   useEffect(() => {
     fetchAdminData();
-    supabase.auth.getUser().then(({ data }) => {
-      if (data?.user) setAdminUserId(data.user.id);
-    });
   }, []);
 
   // MOTOR CHAT REALTIME 2.0 PARA INTERVENCIÓN ADMIN + FALLBACK POLLING 4S
@@ -203,16 +255,21 @@ export default function AdminDashboardScreen() {
                     m.sender_id === incoming.sender_id &&
                     m.content === incoming.content),
               );
-              if (exists) {
-                return prev.map((m) =>
-                  m._optimistic &&
-                  m.sender_id === incoming.sender_id &&
-                  m.content === incoming.content
-                    ? incoming
-                    : m,
-                );
-              }
-              return [...prev, incoming];
+              const nextList = exists
+                ? prev.map((m) =>
+                    m._optimistic &&
+                    m.sender_id === incoming.sender_id &&
+                    m.content === incoming.content
+                      ? incoming
+                      : m,
+                  )
+                : [...prev, incoming];
+
+              setMsgCountsMap((counts) => ({
+                ...counts,
+                [reqId]: nextList.length,
+              }));
+              return nextList;
             });
           },
         )
@@ -237,6 +294,7 @@ export default function AdminDashboardScreen() {
         .eq("request_id", reqId)
         .order("created_at", { ascending: true });
       if (!error && data) {
+        setMsgCountsMap((counts) => ({ ...counts, [reqId]: data.length }));
         setMessages((prev) => {
           if (silent && prev.length === data.length) {
             const lastPrev = prev[prev.length - 1];
@@ -257,6 +315,7 @@ export default function AdminDashboardScreen() {
     setActiveChatReq(req);
     setMessages([]);
     setNewMessage("");
+    setNotifyTarget("both");
     setIsChatOpen(true);
   };
 
@@ -264,9 +323,13 @@ export default function AdminDashboardScreen() {
     const rawText = newMessage.trim();
     if (!rawText || !activeChatReq?.id || sendingMessage) return;
 
-    const formattedText = rawText.startsWith("[Soporte")
-      ? rawText
-      : `[Soporte MiBabysitter]: ${rawText}`;
+    const cleanBody = stripSupportPrefix(rawText);
+    const formattedText = `[Soporte MiBabysitter]: ${cleanBody}`;
+
+    const receiverId =
+      notifyTarget === "parent"
+        ? activeChatReq.parent_id || activeChatReq.babysitter_id
+        : activeChatReq.babysitter_id || activeChatReq.parent_id;
 
     setSendingMessage(true);
     try {
@@ -280,7 +343,7 @@ export default function AdminDashboardScreen() {
         id: tempId,
         request_id: activeChatReq.id,
         sender_id: user.id,
-        receiver_id: activeChatReq.babysitter_id,
+        receiver_id: receiverId,
         content: formattedText,
         created_at: new Date().toISOString(),
         _optimistic: true,
@@ -294,7 +357,7 @@ export default function AdminDashboardScreen() {
           {
             request_id: activeChatReq.id,
             sender_id: user.id,
-            receiver_id: activeChatReq.babysitter_id,
+            receiver_id: receiverId,
             content: formattedText,
           },
         ])
@@ -310,19 +373,43 @@ export default function AdminDashboardScreen() {
         const realMsg = insertedRows[0];
         setMessages((prev) => {
           const alreadyAdded = prev.some((m) => m.id === realMsg.id);
-          if (alreadyAdded) return prev.filter((m) => m.id !== tempId);
-          return prev.map((m) => (m.id === tempId ? realMsg : m));
+          const nextList = alreadyAdded
+            ? prev.filter((m) => m.id !== tempId)
+            : prev.map((m) => (m.id === tempId ? realMsg : m));
+          setMsgCountsMap((counts) => ({
+            ...counts,
+            [activeChatReq.id]: nextList.length,
+          }));
+          return nextList;
         });
       }
 
-      if (activeChatReq.babysitter_id) {
-        await supabase.from("notifications").insert([
-          {
-            user_id: activeChatReq.babysitter_id,
-            title: "🛡️ Mensaje de Soporte",
-            message: `Soporte MiBabysitter te escribió en el chat del turno del ${activeChatReq.job_date}.`,
-          },
-        ]);
+      // Notificación institucional en campanita (deduplicada por usuario)
+      const preview =
+        cleanBody.length > 90 ? cleanBody.slice(0, 87) + "..." : cleanBody;
+      const recipientIds: string[] = [];
+
+      if (
+        (notifyTarget === "both" || notifyTarget === "babysitter") &&
+        activeChatReq.babysitter_id
+      ) {
+        recipientIds.push(activeChatReq.babysitter_id);
+      }
+      if (
+        (notifyTarget === "both" || notifyTarget === "parent") &&
+        activeChatReq.parent_id
+      ) {
+        recipientIds.push(activeChatReq.parent_id);
+      }
+
+      const uniqueRecipients = Array.from(new Set(recipientIds));
+      if (uniqueRecipients.length > 0) {
+        const notifRows = uniqueRecipients.map((uid) => ({
+          user_id: uid,
+          title: "🛡️ Mensaje de Soporte MiBabysitter",
+          message: `Turno ${activeChatReq.job_date || ""}: ${preview}`,
+        }));
+        await supabase.from("notifications").insert(notifRows);
       }
     } catch (err: any) {
       showAlert("Error al enviar mensaje", err.message);
@@ -342,10 +429,12 @@ export default function AdminDashboardScreen() {
       if (reqError) throw reqError;
       if (!reqs || reqs.length === 0) {
         setRequests([]);
+        setMsgCountsMap({});
         setLoading(false);
         return;
       }
 
+      const reqIds = reqs.map((r) => r.id).filter(Boolean);
       const parentIds = Array.from(
         new Set(reqs.map((r) => r.parent_id).filter(Boolean)),
       );
@@ -356,6 +445,19 @@ export default function AdminDashboardScreen() {
       let parentsMap: { [key: string]: any } = {};
       let babysittersMap: { [key: string]: any } = {};
       let nameMap: { [key: string]: string } = {};
+      const counts: { [key: string]: number } = {};
+
+      if (reqIds.length > 0) {
+        const { data: msgRows } = await supabase
+          .from("messages")
+          .select("request_id")
+          .in("request_id", reqIds);
+        msgRows?.forEach((m: any) => {
+          if (m.request_id) {
+            counts[m.request_id] = (counts[m.request_id] || 0) + 1;
+          }
+        });
+      }
 
       if (parentIds.length > 0) {
         const { data: parents } = await supabase
@@ -390,6 +492,7 @@ export default function AdminDashboardScreen() {
         babysitter: babysittersMap[r.babysitter_id] || {},
       }));
 
+      setMsgCountsMap(counts);
       setRequests(combined);
     } catch (error: any) {
       console.error("Error al cargar datos del admin:", error.message);
@@ -532,7 +635,7 @@ export default function AdminDashboardScreen() {
                 onPress={() =>
                   openWhatsApp(
                     req.parent.phone,
-                    `¡Hola! Te escribimos de Babysitter App. Tu servicio agendado para el ${req.job_date} a las ${req.job_time} con ${req.babysitter.first_name} ha sido aceptado, pero vemos que el pago aún está pendiente.`,
+                    `¡Hola! Te escribimos de MiBabysitter.cl. Tu servicio agendado para el ${req.job_date} a las ${req.job_time} con ${req.babysitter.first_name} ha sido aceptado, pero vemos que el pago aún está pendiente.`,
                   )
                 }
               >
@@ -563,7 +666,7 @@ export default function AdminDashboardScreen() {
                 onPress={() =>
                   openWhatsApp(
                     req.babysitter.phone,
-                    `¡Hola ${req.babysitter.first_name}! Desde la plataforma vemos que tu servicio inicia pronto a las ${req.job_time}. ¿Vas en camino?`,
+                    `¡Hola ${req.babysitter.first_name}! Desde MiBabysitter.cl vemos que tu servicio inicia pronto a las ${req.job_time}. ¿Vas en camino?`,
                   )
                 }
               >
@@ -604,7 +707,7 @@ export default function AdminDashboardScreen() {
                 onPress={() =>
                   openWhatsApp(
                     req.babysitter.phone,
-                    `¡Hola ${req.babysitter.first_name}! Tienes una solicitud de cuidado pendiente en la App para el ${req.job_date}. ¿Podrás tomarla?`,
+                    `¡Hola ${req.babysitter.first_name}! Tienes una solicitud de cuidado pendiente en MiBabysitter.cl para el ${req.job_date}. ¿Podrás tomarla?`,
                   )
                 }
               >
@@ -691,6 +794,10 @@ export default function AdminDashboardScreen() {
     .filter((r) => r.payment_status === "ready_for_payout")
     .reduce((sum, r) => sum + (Number(r.babysitter_payout) || 0), 0);
 
+  const conciergeTemplates = activeChatReq
+    ? getConciergeTemplates(activeChatReq)
+    : [];
+
   return (
     <View style={styles.mainWrapper}>
       <ScrollView style={{ flex: 1 }} contentContainerStyle={styles.container}>
@@ -747,6 +854,7 @@ export default function AdminDashboardScreen() {
                 {sortedAlertCards.map(({ req, alert }) => {
                   const parentName = req.parent?.parent_name || "Familia";
                   const sitterName = req.babysitter?.first_name || "Niñera";
+                  const msgCount = msgCountsMap[req.id] || 0;
 
                   return (
                     <View
@@ -814,13 +922,13 @@ export default function AdminDashboardScreen() {
                       <View style={{ marginTop: 8, gap: 8 }}>
                         {renderActionButtons(req, alert.actionType)}
 
-                        {/* NUEVO: BOTÓN DE INTERVENCIÓN CHAT OPERATIVO (ÍTEM #26 FASE 1) */}
                         <TouchableOpacity
                           style={styles.actionBtnPurple}
                           onPress={() => handleOpenAdminChat(req)}
                         >
                           <Text style={styles.actionBtnText}>
-                            💬 Abrir Chat Operativo
+                            💬 Abrir Chat Operativo ({msgCount}{" "}
+                            {msgCount === 1 ? "msg" : "msgs"})
                           </Text>
                         </TouchableOpacity>
                       </View>
@@ -1018,7 +1126,7 @@ export default function AdminDashboardScreen() {
         </TouchableOpacity>
       </View>
 
-      {/* MODAL DE CHAT OPERATIVO DE SOPORTE (ÍTEM #26 FASE 1) */}
+      {/* MODAL DE CHAT OPERATIVO DE SOPORTE (ÍTEM #26 REFINADO) */}
       {isChatOpen && activeChatReq && (
         <Modal
           visible={isChatOpen}
@@ -1029,24 +1137,49 @@ export default function AdminDashboardScreen() {
           <View style={styles.modalOverlay}>
             <View style={styles.chatModalContent}>
               <View style={styles.chatHeader}>
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.chatModalName}>
-                    🛡️ Chat Operativo (Soporte)
+                <View style={{ flex: 1, paddingRight: 8 }}>
+                  <View style={styles.chatHeaderTitleRow}>
+                    <Text style={styles.chatModalName}>🛡️ Chat Operativo</Text>
+                    <View
+                      style={[
+                        styles.chatStatusPill,
+                        activeChatReq.payment_status === "held"
+                          ? styles.chatStatusEscrow
+                          : styles.chatStatusPending,
+                      ]}
+                    >
+                      <Text
+                        style={[
+                          styles.chatStatusPillText,
+                          activeChatReq.payment_status === "held"
+                            ? { color: "#22543d" }
+                            : { color: "#9c4221" },
+                        ]}
+                      >
+                        {activeChatReq.payment_status === "held"
+                          ? "🔒 Escrow"
+                          : activeChatReq.status === "accepted"
+                            ? "Aceptada"
+                            : "Pendiente"}
+                      </Text>
+                    </View>
+                  </View>
+
+                  <Text style={styles.chatContextActors}>
+                    👨‍👩‍👧 {activeChatReq.parent?.parent_name || "Familia"} ↔ 👩‍🍼{" "}
+                    {activeChatReq.babysitter?.first_name || "Niñera"}
                   </Text>
-                  <Text
-                    style={{ fontSize: 12, color: "#4a5568", marginTop: 2 }}
-                  >
-                    Niñera: {activeChatReq.babysitter?.first_name || "Niñera"} •
-                    Familia: {activeChatReq.parent?.parent_name || "Familia"}
-                  </Text>
-                  <Text
-                    style={{ fontSize: 11, color: "#38a169", marginTop: 2 }}
-                  >
-                    ● Conectado en tiempo real
+                  <Text style={styles.chatContextShift}>
+                    📅 {activeChatReq.job_date || "Sin fecha"} • ⏰{" "}
+                    {activeChatReq.job_time || "Sin hora"} •{" "}
+                    <Text style={{ color: "#38a169", fontWeight: "600" }}>
+                      ● En vivo
+                    </Text>
                   </Text>
                 </View>
+
                 <TouchableOpacity onPress={() => setIsChatOpen(false)}>
-                  <Text style={{ fontSize: 24, color: "#718096" }}>×</Text>
+                  <Text style={{ fontSize: 26, color: "#718096" }}>×</Text>
                 </TouchableOpacity>
               </View>
 
@@ -1059,53 +1192,75 @@ export default function AdminDashboardScreen() {
                 }
               >
                 {messages.length === 0 ? (
-                  <Text style={styles.emptyText}>
-                    Aún no hay mensajes en este turno. Escribe abajo para
-                    intervenir como Soporte MiBabysitter.
-                  </Text>
+                  <View style={styles.chatEmptyBox}>
+                    <Text style={styles.chatEmptyTitle}>
+                      👀 Modo Observación Activo
+                    </Text>
+                    <Text style={styles.chatEmptySub}>
+                      Aún no hay mensajes entre familia y niñera en este turno.
+                      Puedes usar una plantilla rápida o escribir abajo para
+                      intervenir como Soporte MiBabysitter.
+                    </Text>
+                  </View>
                 ) : (
                   messages.map((msg, idx) => {
-                    const isSupport =
-                      msg.content?.startsWith("[Soporte") ||
-                      (adminUserId &&
-                        msg.sender_id === adminUserId &&
-                        msg.sender_id !== activeChatReq.babysitter_id &&
-                        msg.sender_id !== activeChatReq.parent_id);
+                    const isSupport = Boolean(
+                      msg.content?.startsWith("[Soporte"),
+                    );
+                    const isBabysitter =
+                      !isSupport &&
+                      msg.sender_id === activeChatReq.babysitter_id;
 
                     const senderLabel = isSupport
                       ? "🛡️ Soporte MiBabysitter"
-                      : msg.sender_id === activeChatReq.babysitter_id
+                      : isBabysitter
                         ? `👩‍🍼 ${activeChatReq.babysitter?.first_name || "Niñera"}`
                         : `👨‍👩‍👧 ${activeChatReq.parent?.parent_name || "Familia"}`;
+
+                    const displayContent = isSupport
+                      ? stripSupportPrefix(msg.content)
+                      : msg.content;
+                    const timeStr = formatMsgTime(msg.created_at);
 
                     return (
                       <View
                         key={msg.id || idx}
                         style={[
                           styles.messageBubble,
-                          isSupport ? styles.messageMe : styles.messageThem,
-                          msg._optimistic && { opacity: 0.75 },
+                          isSupport
+                            ? styles.messageSupport
+                            : isBabysitter
+                              ? styles.messageSitter
+                              : styles.messageParent,
+                          msg._optimistic && { opacity: 0.72 },
                         ]}
                       >
-                        <Text
-                          style={[
-                            styles.senderTag,
-                            isSupport
-                              ? { color: "#e9d8fd" }
-                              : { color: "#4a5568" },
-                          ]}
-                        >
-                          {senderLabel}
-                        </Text>
+                        <View style={styles.msgHeaderRow}>
+                          <Text
+                            style={[
+                              styles.senderTag,
+                              isSupport
+                                ? { color: "#9c4221" }
+                                : isBabysitter
+                                  ? { color: "#553c9a" }
+                                  : { color: "#2b6cb0" },
+                            ]}
+                          >
+                            {senderLabel}
+                          </Text>
+                          {Boolean(timeStr) && (
+                            <Text style={styles.msgTimeText}>{timeStr}</Text>
+                          )}
+                        </View>
                         <Text
                           style={[
                             styles.messageText,
                             isSupport
-                              ? styles.messageTextMe
-                              : styles.messageTextThem,
+                              ? { color: "#744210" }
+                              : { color: "#1a202c" },
                           ]}
                         >
-                          {msg.content}
+                          {displayContent}
                         </Text>
                       </View>
                     );
@@ -1113,14 +1268,66 @@ export default function AdminDashboardScreen() {
                 )}
               </ScrollView>
 
+              {/* PLANTILLAS CONCIERGE EDITABLES EN 1 CLIC */}
+              <View style={styles.conciergeBar}>
+                <ScrollView
+                  horizontal
+                  showsHorizontalScrollIndicator={false}
+                  contentContainerStyle={styles.conciergeScroll}
+                >
+                  {conciergeTemplates.map((tpl) => (
+                    <TouchableOpacity
+                      key={tpl.id}
+                      style={styles.conciergeChip}
+                      onPress={() => setNewMessage(tpl.text)}
+                    >
+                      <Text style={styles.conciergeChipText}>{tpl.label}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </ScrollView>
+
+                <View style={styles.notifyTargetRow}>
+                  <Text style={styles.notifyTargetLabel}>🔔 Notificar:</Text>
+                  {(
+                    [
+                      { key: "both", label: "👥 Ambos" },
+                      { key: "parent", label: "👨‍👩‍👧 Familia" },
+                      { key: "babysitter", label: "👩‍🍼 Niñera" },
+                    ] as const
+                  ).map((opt) => {
+                    const selected = notifyTarget === opt.key;
+                    return (
+                      <TouchableOpacity
+                        key={opt.key}
+                        style={[
+                          styles.notifyPill,
+                          selected && styles.notifyPillActive,
+                        ]}
+                        onPress={() => setNotifyTarget(opt.key)}
+                      >
+                        <Text
+                          style={[
+                            styles.notifyPillText,
+                            selected && styles.notifyPillTextActive,
+                          ]}
+                        >
+                          {opt.label}
+                        </Text>
+                      </TouchableOpacity>
+                    );
+                  })}
+                </View>
+              </View>
+
               <View style={styles.chatInputRow}>
                 <TextInput
                   style={styles.chatInput}
-                  placeholder="Escribir como Soporte..."
+                  placeholder="Escribir como Soporte MiBabysitter..."
                   value={newMessage}
                   onChangeText={setNewMessage}
                   onSubmitEditing={sendAdminMessage}
                   returnKeyType="send"
+                  multiline
                 />
                 <TouchableOpacity
                   style={styles.chatSendButton}
@@ -1361,60 +1568,185 @@ const styles = StyleSheet.create({
   },
   backButtonText: { color: "#ffffff", fontSize: 16, fontWeight: "bold" },
 
-  // ESTILOS DEL CHAT OPERATIVO ADMIN
+  // ESTILOS DEL CHAT OPERATIVO ADMIN (3 ACTORES + CONCIERGE)
   modalOverlay: {
     flex: 1,
     backgroundColor: "rgba(0,0,0,0.5)",
     justifyContent: "center",
     alignItems: "center",
-    padding: 16,
+    padding: 12,
   },
   chatModalContent: {
     backgroundColor: "#ffffff",
     borderRadius: 16,
     width: "100%",
-    maxWidth: 480,
-    height: "80%",
+    maxWidth: 520,
+    height: "86%",
     display: "flex",
     flexDirection: "column",
+    overflow: "hidden",
   },
   chatHeader: {
     flexDirection: "row",
     justifyContent: "space-between",
-    alignItems: "center",
-    padding: 16,
+    alignItems: "flex-start",
+    padding: 14,
     borderBottomWidth: 1,
     borderBottomColor: "#edf2f7",
+    backgroundColor: "#ffffff",
   },
-  chatModalName: { fontSize: 18, fontWeight: "bold", color: "#2d3748" },
+  chatHeaderTitleRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    flexWrap: "wrap",
+  },
+  chatModalName: { fontSize: 17, fontWeight: "bold", color: "#1a202c" },
+  chatStatusPill: {
+    paddingVertical: 2,
+    paddingHorizontal: 8,
+    borderRadius: 10,
+  },
+  chatStatusEscrow: { backgroundColor: "#c6f6d5" },
+  chatStatusPending: { backgroundColor: "#feebc8" },
+  chatStatusPillText: { fontSize: 11, fontWeight: "bold" },
+  chatContextActors: {
+    fontSize: 13,
+    fontWeight: "600",
+    color: "#2d3748",
+    marginTop: 4,
+  },
+  chatContextShift: {
+    fontSize: 12,
+    color: "#718096",
+    marginTop: 2,
+  },
   chatScroll: { flex: 1, backgroundColor: "#f7fafc" },
-  messageBubble: {
-    maxWidth: "82%",
-    padding: 12,
+  chatEmptyBox: {
+    backgroundColor: "#ffffff",
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
     borderRadius: 12,
-    marginBottom: 8,
+    padding: 16,
+    marginTop: 12,
+    alignItems: "center",
   },
-  messageMe: {
+  chatEmptyTitle: {
+    fontSize: 14,
+    fontWeight: "bold",
+    color: "#2d3748",
+    marginBottom: 4,
+  },
+  chatEmptySub: {
+    fontSize: 13,
+    color: "#718096",
+    textAlign: "center",
+    lineHeight: 18,
+  },
+  messageBubble: {
+    maxWidth: "85%",
+    padding: 11,
+    borderRadius: 12,
+    marginBottom: 10,
+    borderWidth: 1,
+  },
+  messageSupport: {
     alignSelf: "flex-end",
-    backgroundColor: "#805ad5",
+    backgroundColor: "#fffaf0",
+    borderColor: "#d69e2e",
     borderBottomRightRadius: 4,
   },
-  messageThem: {
+  messageParent: {
     alignSelf: "flex-start",
-    backgroundColor: "#e2e8f0",
+    backgroundColor: "#ebf8ff",
+    borderColor: "#bee3f8",
     borderBottomLeftRadius: 4,
+  },
+  messageSitter: {
+    alignSelf: "flex-start",
+    backgroundColor: "#faf5ff",
+    borderColor: "#d6bcfa",
+    borderBottomLeftRadius: 4,
+  },
+  msgHeaderRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    gap: 10,
+    marginBottom: 4,
   },
   senderTag: {
     fontSize: 11,
     fontWeight: "bold",
-    marginBottom: 4,
   },
-  messageText: { fontSize: 15 },
-  messageTextMe: { color: "#ffffff" },
-  messageTextThem: { color: "#2d3748" },
+  msgTimeText: {
+    fontSize: 10,
+    color: "#718096",
+  },
+  messageText: { fontSize: 14, lineHeight: 20 },
+
+  conciergeBar: {
+    borderTopWidth: 1,
+    borderTopColor: "#edf2f7",
+    backgroundColor: "#f8fafc",
+    paddingTop: 8,
+    paddingBottom: 6,
+    paddingHorizontal: 12,
+  },
+  conciergeScroll: {
+    gap: 8,
+    paddingBottom: 8,
+  },
+  conciergeChip: {
+    backgroundColor: "#ffffff",
+    borderWidth: 1,
+    borderColor: "#cbd5e0",
+    borderRadius: 16,
+    paddingVertical: 5,
+    paddingHorizontal: 11,
+  },
+  conciergeChipText: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: "#2d3748",
+  },
+  notifyTargetRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    flexWrap: "wrap",
+  },
+  notifyTargetLabel: {
+    fontSize: 11,
+    fontWeight: "600",
+    color: "#718096",
+  },
+  notifyPill: {
+    paddingVertical: 3,
+    paddingHorizontal: 9,
+    borderRadius: 12,
+    backgroundColor: "#edf2f7",
+    borderWidth: 1,
+    borderColor: "#cbd5e0",
+  },
+  notifyPillActive: {
+    backgroundColor: "#fefcbf",
+    borderColor: "#d69e2e",
+  },
+  notifyPillText: {
+    fontSize: 11,
+    fontWeight: "600",
+    color: "#4a5568",
+  },
+  notifyPillTextActive: {
+    color: "#975a16",
+    fontWeight: "bold",
+  },
+
   chatInputRow: {
     flexDirection: "row",
-    padding: 12,
+    alignItems: "flex-end",
+    padding: 10,
     borderTopWidth: 1,
     borderTopColor: "#edf2f7",
     backgroundColor: "#ffffff",
@@ -1423,18 +1755,20 @@ const styles = StyleSheet.create({
     flex: 1,
     borderWidth: 1,
     borderColor: "#cbd5e0",
-    borderRadius: 20,
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    fontSize: 15,
+    borderRadius: 18,
+    paddingHorizontal: 14,
+    paddingVertical: 9,
+    fontSize: 14,
+    maxHeight: 96,
     backgroundColor: "#f8fafc",
     marginRight: 8,
   },
   chatSendButton: {
-    backgroundColor: "#805ad5",
+    backgroundColor: "#d69e2e",
     paddingHorizontal: 16,
+    paddingVertical: 10,
     justifyContent: "center",
-    borderRadius: 20,
+    borderRadius: 18,
   },
-  chatSendButtonText: { color: "#ffffff", fontWeight: "bold" },
+  chatSendButtonText: { color: "#ffffff", fontWeight: "bold", fontSize: 14 },
 });

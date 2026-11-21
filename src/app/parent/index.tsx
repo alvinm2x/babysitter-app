@@ -118,6 +118,23 @@ const formatCLP = (amount: number | string) => {
   return "$" + new Intl.NumberFormat("es-CL").format(Math.round(num)) + " CLP";
 };
 
+const formatMsgTime = (iso?: string) => {
+  if (!iso) return "";
+  try {
+    return new Date(iso).toLocaleTimeString("es-CL", {
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    });
+  } catch {
+    return "";
+  }
+};
+
+const stripSupportPrefix = (content?: string) => {
+  return String(content || "").replace(/^\[Soporte[^\]]*\]:\s*/i, "");
+};
+
 const timeToMinutes = (timeStr: string) => {
   const [hours, minutes] = timeStr.split(":").map(Number);
   return hours * 60 + minutes;
@@ -2623,6 +2640,37 @@ export default function ParentHomeScreen() {
                   </Text>
                 ) : (
                   messages.map((msg, idx) => {
+                    const isSupport = Boolean(
+                      msg.content?.startsWith("[Soporte"),
+                    );
+                    const timeStr = formatMsgTime(msg.created_at);
+
+                    if (isSupport) {
+                      return (
+                        <View
+                          key={msg.id || idx}
+                          style={[
+                            styles.messageSupport,
+                            msg._optimistic && { opacity: 0.75 },
+                          ]}
+                        >
+                          <View style={styles.supportHeaderRow}>
+                            <Text style={styles.supportBadgeText}>
+                              🛡️ Soporte MiBabysitter
+                            </Text>
+                            {Boolean(timeStr) && (
+                              <Text style={styles.msgTimeSupport}>
+                                {timeStr}
+                              </Text>
+                            )}
+                          </View>
+                          <Text style={styles.supportMessageText}>
+                            {stripSupportPrefix(msg.content)}
+                          </Text>
+                        </View>
+                      );
+                    }
+
                     const isMe = msg.sender_id !== activeChatSitter?.id;
                     return (
                       <View
@@ -2643,6 +2691,13 @@ export default function ParentHomeScreen() {
                         >
                           {msg.content}
                         </Text>
+                        {Boolean(timeStr) && (
+                          <Text
+                            style={isMe ? styles.msgTimeMe : styles.msgTimeThem}
+                          >
+                            {timeStr}
+                          </Text>
+                        )}
                       </View>
                     );
                   })
@@ -3424,9 +3479,50 @@ const styles = StyleSheet.create({
     backgroundColor: "#e2e8f0",
     borderBottomLeftRadius: 4,
   },
+  messageSupport: {
+    alignSelf: "stretch",
+    backgroundColor: "#fffaf0",
+    borderWidth: 1.5,
+    borderColor: "#d69e2e",
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 10,
+  },
+  supportHeaderRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 4,
+  },
+  supportBadgeText: {
+    fontSize: 12,
+    fontWeight: "bold",
+    color: "#9c4221",
+  },
+  supportMessageText: {
+    fontSize: 14,
+    color: "#744210",
+    lineHeight: 20,
+  },
   messageText: { fontSize: 15 },
   messageTextMe: { color: "#ffffff" },
   messageTextThem: { color: "#2d3748" },
+  msgTimeMe: {
+    fontSize: 10,
+    color: "#e9d8fd",
+    marginTop: 4,
+    alignSelf: "flex-end",
+  },
+  msgTimeThem: {
+    fontSize: 10,
+    color: "#718096",
+    marginTop: 4,
+    alignSelf: "flex-end",
+  },
+  msgTimeSupport: {
+    fontSize: 10,
+    color: "#975a16",
+  },
   chatInputRow: {
     flexDirection: "row",
     padding: 12,
