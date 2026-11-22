@@ -122,6 +122,21 @@ const isLocationUnlocked = (status?: string, paymentStatus?: string) => {
   return s === "accepted" && isPaidOrHeld;
 };
 
+const hasValidCoords = (info: any) => {
+  const lat = Number(info?.lat);
+  const lng = Number(info?.lng);
+  return (
+    info?.lat !== null &&
+    info?.lat !== undefined &&
+    info?.lng !== null &&
+    info?.lng !== undefined &&
+    !isNaN(lat) &&
+    !isNaN(lng) &&
+    lat !== 0 &&
+    lng !== 0
+  );
+};
+
 const showAlert = (title: string, message: string) => {
   if (Platform.OS === "web") {
     alert(title + ": " + message);
@@ -222,6 +237,7 @@ export default function BabysitterHomeScreen() {
   const typingClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
     null,
   );
+  const copyResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [activeTab, setActiveTab] = useState<
     "requests" | "history" | "profile"
@@ -232,6 +248,7 @@ export default function BabysitterHomeScreen() {
   const [loadingRequests, setLoadingRequests] = useState(true);
   const [requests, setRequests] = useState<any[]>([]);
   const [updatingId, setUpdatingId] = useState<string | null>(null);
+  const [copiedAddressId, setCopiedAddressId] = useState<string | null>(null);
   const [loadingProfile, setLoadingProfile] = useState(false);
   const [savingProfile, setSavingProfile] = useState(false);
 
@@ -265,7 +282,7 @@ export default function BabysitterHomeScreen() {
   const [newMessage, setNewMessage] = useState("");
   const [sendingMessage, setSendingMessage] = useState(false);
 
-  // NUEVO: ESTADOS CHAT 2.0 FASE 2 (#24)
+  // ESTADOS CHAT 2.0 FASE 2 (#24)
   const [unreadMap, setUnreadMap] = useState<{
     [reqId: string]: { count: number; hasSupport: boolean };
   }>({});
@@ -284,6 +301,108 @@ export default function BabysitterHomeScreen() {
     isChatOpenRef.current = isChatOpen;
     activeRequestIdRef.current = activeRequestId;
   }, [isChatOpen, activeRequestId]);
+
+  useEffect(() => {
+    return () => {
+      if (copyResetTimerRef.current) clearTimeout(copyResetTimerRef.current);
+    };
+  }, []);
+
+  // NAVEGACIÓN RÁPIDA EN 1 TOQUE (#28 FASE 1)
+  const handleOpenGoogleMaps = (parentInfo: any) => {
+    if (hasValidCoords(parentInfo)) {
+      const url = `https://www.google.com/maps/dir/?api=1&destination=${parentInfo.lat},${parentInfo.lng}`;
+      Linking.openURL(url);
+      return;
+    }
+    const rawAddr = String(parentInfo?.address || "").trim();
+    if (!rawAddr) {
+      showAlert(
+        "Sin dirección",
+        "Esta familia aún no ha registrado una dirección válida.",
+      );
+      return;
+    }
+    const destination = rawAddr.toLowerCase().includes("chile")
+      ? rawAddr
+      : `${rawAddr}, Santiago, Chile`;
+    Linking.openURL(
+      `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(destination)}`,
+    );
+  };
+
+  const handleOpenWaze = (parentInfo: any) => {
+    if (hasValidCoords(parentInfo)) {
+      const url = `https://waze.com/ul?ll=${parentInfo.lat},${parentInfo.lng}&navigate=yes`;
+      Linking.openURL(url);
+      return;
+    }
+    const rawAddr = String(parentInfo?.address || "").trim();
+    if (!rawAddr) {
+      showAlert(
+        "Sin dirección",
+        "Esta familia aún no ha registrado una dirección válida.",
+      );
+      return;
+    }
+    const query = rawAddr.toLowerCase().includes("chile")
+      ? rawAddr
+      : `${rawAddr}, Santiago, Chile`;
+    Linking.openURL(
+      `https://waze.com/ul?q=${encodeURIComponent(query)}&navigate=yes`,
+    );
+  };
+
+  const handleCopyAddress = async (reqId: string, parentInfo: any) => {
+    const parts = [
+      String(parentInfo?.address || "").trim(),
+      String(parentInfo?.address_detail || "").trim(),
+    ].filter(Boolean);
+
+    if (parts.length === 0) {
+      showAlert(
+        "Sin dirección",
+        "Esta familia aún no ha registrado una dirección válida.",
+      );
+      return;
+    }
+
+    const fullText = parts.join(" — ");
+    let copied = false;
+
+    try {
+      const nav = (globalThis as any)?.navigator;
+      if (nav?.clipboard?.writeText) {
+        await nav.clipboard.writeText(fullText);
+        copied = true;
+      } else if (Platform.OS === "web") {
+        const doc = (globalThis as any)?.document;
+        if (doc?.createElement && doc?.body) {
+          const textarea = doc.createElement("textarea");
+          textarea.value = fullText;
+          textarea.style.position = "fixed";
+          textarea.style.opacity = "0";
+          doc.body.appendChild(textarea);
+          textarea.focus();
+          textarea.select();
+          copied = Boolean(doc.execCommand && doc.execCommand("copy"));
+          doc.body.removeChild(textarea);
+        }
+      }
+    } catch {
+      copied = false;
+    }
+
+    if (copied) {
+      setCopiedAddressId(String(reqId));
+      if (copyResetTimerRef.current) clearTimeout(copyResetTimerRef.current);
+      copyResetTimerRef.current = setTimeout(() => {
+        setCopiedAddressId(null);
+      }, 2200);
+    } else {
+      showAlert("Dirección exacta", fullText);
+    }
+  };
 
   const loadUnreadStats = async (reqIds: string[], explicitUserId?: string) => {
     if (!reqIds || reqIds.length === 0) {
@@ -910,7 +1029,7 @@ export default function BabysitterHomeScreen() {
       if (parentIds.length > 0) {
         const { data: profiles, error: profError } = await supabase
           .from("parent_profiles")
-          .select("id, phone, address, children_info, emergency_contact")
+          .select("*")
           .in("id", parentIds);
 
         if (!profError && profiles) {
@@ -1405,6 +1524,7 @@ export default function BabysitterHomeScreen() {
                 {activeRequests.map((req) => {
                   const isUpdatingThis = updatingId === req.id;
                   const isHighlighted = highlightedRequestId === String(req.id);
+                  const isCopied = copiedAddressId === String(req.id);
                   const unreadInfo = unreadMap[String(req.id)] || {
                     count: 0,
                     hasSupport: false,
@@ -1423,7 +1543,13 @@ export default function BabysitterHomeScreen() {
                   );
                   const approximateZone = extractApproximateZone(
                     parentInfo.address,
-                    req.location_zone || parentInfo.comuna,
+                    parentInfo.commune ||
+                      req.location_zone ||
+                      parentInfo.comuna,
+                  );
+                  const hasAddressOrCoords = Boolean(
+                    hasValidCoords(parentInfo) ||
+                    String(parentInfo.address || "").trim(),
                   );
 
                   const reqHours = getHoursFromTimeRange(req.job_time);
@@ -1633,6 +1759,14 @@ export default function BabysitterHomeScreen() {
                                   {parentInfo.address || "No especificada"}
                                 </Text>
                               </Text>
+                              {Boolean(parentInfo.address_detail) && (
+                                <Text style={styles.contactText}>
+                                  🏢 Depto / Ref.:{" "}
+                                  <Text style={{ fontWeight: "600" }}>
+                                    {parentInfo.address_detail}
+                                  </Text>
+                                </Text>
+                              )}
                               <Text style={styles.contactText}>
                                 👶 Niños:{" "}
                                 {parentInfo.children_info || "No especificado"}
@@ -1646,6 +1780,51 @@ export default function BabysitterHomeScreen() {
                                   🚨 Emergencia: {parentInfo.emergency_contact}
                                 </Text>
                               ) : null}
+
+                              {/* BARRA DE TRASLADO RÁPIDO EN 1 TOQUE (#28 FASE 1) */}
+                              {hasAddressOrCoords && (
+                                <View style={styles.navActionsRow}>
+                                  <TouchableOpacity
+                                    style={[styles.navBtn, styles.navBtnMaps]}
+                                    onPress={() =>
+                                      handleOpenGoogleMaps(parentInfo)
+                                    }
+                                  >
+                                    <Text style={styles.navBtnMapsText}>
+                                      🗺️ Maps
+                                    </Text>
+                                  </TouchableOpacity>
+                                  <TouchableOpacity
+                                    style={[styles.navBtn, styles.navBtnWaze]}
+                                    onPress={() => handleOpenWaze(parentInfo)}
+                                  >
+                                    <Text style={styles.navBtnWazeText}>
+                                      🚗 Waze
+                                    </Text>
+                                  </TouchableOpacity>
+                                  <TouchableOpacity
+                                    style={[
+                                      styles.navBtn,
+                                      isCopied
+                                        ? styles.navBtnCopied
+                                        : styles.navBtnCopy,
+                                    ]}
+                                    onPress={() =>
+                                      handleCopyAddress(req.id, parentInfo)
+                                    }
+                                  >
+                                    <Text
+                                      style={
+                                        isCopied
+                                          ? styles.navBtnCopiedText
+                                          : styles.navBtnCopyText
+                                      }
+                                    >
+                                      {isCopied ? "✅ Copiado" : "📋 Copiar"}
+                                    </Text>
+                                  </TouchableOpacity>
+                                </View>
+                              )}
                             </>
                           ) : (
                             <>
@@ -1702,7 +1881,12 @@ export default function BabysitterHomeScreen() {
                                 req.job_date,
                                 req.job_time,
                                 exactLocationUnlocked
-                                  ? parentInfo.address
+                                  ? [
+                                      parentInfo.address,
+                                      parentInfo.address_detail,
+                                    ]
+                                      .filter(Boolean)
+                                      .join(", ")
                                   : approximateZone,
                               )
                             }
@@ -1888,7 +2072,9 @@ export default function BabysitterHomeScreen() {
                   const isRejected = statusNormalized === "rejected";
                   const approximateZone = extractApproximateZone(
                     parentInfo.address,
-                    req.location_zone || parentInfo.comuna,
+                    parentInfo.commune ||
+                      req.location_zone ||
+                      parentInfo.comuna,
                   );
 
                   const histHours = getHoursFromTimeRange(req.job_time);
@@ -2851,6 +3037,59 @@ const styles = StyleSheet.create({
     color: "#718096",
     fontStyle: "italic",
     marginTop: 4,
+  },
+
+  // BARRA DE TRASLADO RÁPIDO (#28 FASE 1)
+  navActionsRow: {
+    flexDirection: "row",
+    gap: 8,
+    marginTop: 8,
+    marginBottom: 4,
+  },
+  navBtn: {
+    flex: 1,
+    paddingVertical: 9,
+    paddingHorizontal: 8,
+    borderRadius: 8,
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 1,
+  },
+  navBtnMaps: {
+    backgroundColor: "#ebf8ff",
+    borderColor: "#90cdf4",
+  },
+  navBtnMapsText: {
+    color: "#2b6cb0",
+    fontWeight: "bold",
+    fontSize: 13,
+  },
+  navBtnWaze: {
+    backgroundColor: "#e6fffa",
+    borderColor: "#81e6d9",
+  },
+  navBtnWazeText: {
+    color: "#234e52",
+    fontWeight: "bold",
+    fontSize: 13,
+  },
+  navBtnCopy: {
+    backgroundColor: "#edf2f7",
+    borderColor: "#cbd5e0",
+  },
+  navBtnCopyText: {
+    color: "#4a5568",
+    fontWeight: "bold",
+    fontSize: 13,
+  },
+  navBtnCopied: {
+    backgroundColor: "#c6f6d5",
+    borderColor: "#68d391",
+  },
+  navBtnCopiedText: {
+    color: "#22543d",
+    fontWeight: "bold",
+    fontSize: 13,
   },
 
   contactButton: {
