@@ -1,3 +1,6 @@
+import AddressAutocompleteInput, {
+  ResolvedPlaceData,
+} from "@/components/AddressAutocompleteInput";
 import { supabase } from "@/utils/supabase";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { useEffect, useRef, useState } from "react";
@@ -273,7 +276,7 @@ export default function ParentHomeScreen() {
   const [newMessage, setNewMessage] = useState("");
   const [sendingMessage, setSendingMessage] = useState(false);
 
-  // NUEVO: ESTADOS CHAT 2.0 FASE 2 (#24)
+  // ESTADOS CHAT 2.0 FASE 2 (#24)
   const [unreadMap, setUnreadMap] = useState<{
     [reqId: string]: { count: number; hasSupport: boolean };
   }>({});
@@ -284,9 +287,29 @@ export default function ParentHomeScreen() {
     null,
   );
 
-  const [parentProfile, setParentProfile] = useState({
+  // PERFIL DE PADRES + GEOLOCALIZACIÓN (#28)
+  const [parentProfile, setParentProfile] = useState<{
+    phone: string;
+    address: string;
+    address_detail: string;
+    commune: string;
+    google_place_id: string | null;
+    lat: number | null;
+    lng: number | null;
+    approx_lat: number | null;
+    approx_lng: number | null;
+    children_info: string;
+    emergency_contact: string;
+  }>({
     phone: "",
     address: "",
+    address_detail: "",
+    commune: "",
+    google_place_id: null,
+    lat: null,
+    lng: null,
+    approx_lat: null,
+    approx_lng: null,
     children_info: "",
     emergency_contact: "",
   });
@@ -301,6 +324,61 @@ export default function ParentHomeScreen() {
     string | null
   >(null);
   const [savingGateProfile, setSavingGateProfile] = useState(false);
+
+  const isAddressVerified = Boolean(
+    parentProfile.google_place_id &&
+    parentProfile.lat !== null &&
+    parentProfile.lng !== null,
+  );
+  const effectiveCommune = (
+    parentProfile.commune ||
+    selectedParentCommune ||
+    detectCommuneFromAddress(parentProfile.address)
+  ).trim();
+  const shouldShowManualCommuneChips = !isAddressVerified || !effectiveCommune;
+
+  const handleAddressTextChange = (text: string) => {
+    setParentProfile((prev) => ({
+      ...prev,
+      address: text,
+      commune: "",
+      google_place_id: null,
+      lat: null,
+      lng: null,
+      approx_lat: null,
+      approx_lng: null,
+    }));
+  };
+
+  const handleSelectResolvedPlace = (place: ResolvedPlaceData) => {
+    setParentProfile((prev) => ({
+      ...prev,
+      address: place.address,
+      commune: place.commune,
+      google_place_id: place.google_place_id,
+      lat: place.lat,
+      lng: place.lng,
+      approx_lat: place.approx_lat,
+      approx_lng: place.approx_lng,
+    }));
+    if (place.commune) {
+      setSelectedParentCommune(place.commune);
+    }
+  };
+
+  const handleClearAddress = () => {
+    setParentProfile((prev) => ({
+      ...prev,
+      address: "",
+      commune: "",
+      google_place_id: null,
+      lat: null,
+      lng: null,
+      approx_lat: null,
+      approx_lng: null,
+    }));
+    setSelectedParentCommune("");
+  };
 
   const toggleBreakdown = (id: string) => {
     setExpandedBreakdownIds((prev) => ({ ...prev, [id]: !prev[id] }));
@@ -1058,14 +1136,20 @@ export default function ParentHomeScreen() {
     const hasAddress =
       parentProfile.address && parentProfile.address.trim().length >= 5;
     const hasCommune = Boolean(
-      selectedParentCommune || detectCommuneFromAddress(parentProfile.address),
+      parentProfile.commune ||
+      selectedParentCommune ||
+      detectCommuneFromAddress(parentProfile.address),
     );
     const hasChildrenInfo =
       parentProfile.children_info &&
       parentProfile.children_info.trim().length >= 2;
 
     if (!hasPhone || !hasAddress || !hasCommune || !hasChildrenInfo) {
-      if (!selectedParentCommune && selectedZone !== "Todas") {
+      if (
+        !parentProfile.commune &&
+        !selectedParentCommune &&
+        selectedZone !== "Todas"
+      ) {
         setSelectedParentCommune(selectedZone);
       }
       setPendingSitterIdForGate(babysitterId);
@@ -1085,17 +1169,22 @@ export default function ParentHomeScreen() {
       );
       return;
     }
-    if (!selectedParentCommune) {
-      showAlert(
-        "Comuna requerida",
-        "Selecciona tu comuna para que la niñera pueda evaluar su traslado antes de aceptar.",
-      );
-      return;
-    }
     if (!parentProfile.address || parentProfile.address.trim().length < 5) {
       showAlert(
         "Dirección requerida",
         "Por favor indica tu dirección exacta (solo se revelará cuando la reserva esté confirmada).",
+      );
+      return;
+    }
+    const resolvedCommune = (
+      parentProfile.commune ||
+      selectedParentCommune ||
+      detectCommuneFromAddress(parentProfile.address)
+    ).trim();
+    if (!resolvedCommune) {
+      showAlert(
+        "Comuna requerida",
+        "Elige una sugerencia de dirección o selecciona tu comuna abajo para que la niñera evalúe su traslado.",
       );
       return;
     }
@@ -1117,15 +1206,24 @@ export default function ParentHomeScreen() {
       } = await supabase.auth.getUser();
       if (!user) throw new Error("No hay sesión activa");
 
-      const finalAddress = formatAddressWithCommune(
-        parentProfile.address,
-        selectedParentCommune,
-      );
+      const finalAddress = isAddressVerified
+        ? parentProfile.address.trim()
+        : formatAddressWithCommune(parentProfile.address, resolvedCommune);
+      const cleanCommune =
+        resolvedCommune && resolvedCommune !== "Otra" ? resolvedCommune : null;
+      const cleanDetail = (parentProfile.address_detail || "").trim();
 
       const updates = {
         id: user.id,
         phone: parentProfile.phone.trim(),
         address: finalAddress,
+        address_detail: cleanDetail || null,
+        commune: cleanCommune,
+        google_place_id: parentProfile.google_place_id,
+        lat: parentProfile.lat,
+        lng: parentProfile.lng,
+        approx_lat: parentProfile.approx_lat,
+        approx_lng: parentProfile.approx_lng,
         children_info: parentProfile.children_info.trim(),
         emergency_contact: (parentProfile.emergency_contact || "").trim(),
         updated_at: new Date(),
@@ -1134,7 +1232,12 @@ export default function ParentHomeScreen() {
       const { error } = await supabase.from("parent_profiles").upsert(updates);
       if (error) throw error;
 
-      setParentProfile((prev) => ({ ...prev, address: finalAddress }));
+      setParentProfile((prev) => ({
+        ...prev,
+        address: finalAddress,
+        address_detail: cleanDetail,
+        commune: cleanCommune || "",
+      }));
       setShowOnboardingGateModal(false);
       const targetSitterId = pendingSitterIdForGate || selectedSitter?.id;
       setPendingSitterIdForGate(null);
@@ -1407,13 +1510,24 @@ export default function ParentHomeScreen() {
       if (error && error.code !== "PGRST116") return;
       if (data) {
         const loadedAddr = data.address || "";
+        const loadedCommune =
+          data.commune || detectCommuneFromAddress(loadedAddr);
         setParentProfile({
           phone: data.phone || "",
           address: loadedAddr,
+          address_detail: data.address_detail || "",
+          commune: data.commune || "",
+          google_place_id: data.google_place_id || null,
+          lat: typeof data.lat === "number" ? data.lat : null,
+          lng: typeof data.lng === "number" ? data.lng : null,
+          approx_lat:
+            typeof data.approx_lat === "number" ? data.approx_lat : null,
+          approx_lng:
+            typeof data.approx_lng === "number" ? data.approx_lng : null,
           children_info: data.children_info || "",
           emergency_contact: data.emergency_contact || "",
         });
-        setSelectedParentCommune(detectCommuneFromAddress(loadedAddr));
+        setSelectedParentCommune(loadedCommune);
       }
     } catch (error) {}
   };
@@ -1427,22 +1541,42 @@ export default function ParentHomeScreen() {
       } = await supabase.auth.getUser();
       if (!user) throw new Error("No hay sesión activa");
 
-      const finalAddress = formatAddressWithCommune(
-        parentProfile.address,
-        selectedParentCommune,
-      );
+      const resolvedCommune = (
+        parentProfile.commune ||
+        selectedParentCommune ||
+        detectCommuneFromAddress(parentProfile.address)
+      ).trim();
+
+      const finalAddress = isAddressVerified
+        ? parentProfile.address.trim()
+        : formatAddressWithCommune(parentProfile.address, resolvedCommune);
+      const cleanCommune =
+        resolvedCommune && resolvedCommune !== "Otra" ? resolvedCommune : null;
+      const cleanDetail = (parentProfile.address_detail || "").trim();
 
       const updates = {
         id: user.id,
         phone: parentProfile.phone.trim(),
         address: finalAddress,
+        address_detail: cleanDetail || null,
+        commune: cleanCommune,
+        google_place_id: parentProfile.google_place_id,
+        lat: parentProfile.lat,
+        lng: parentProfile.lng,
+        approx_lat: parentProfile.approx_lat,
+        approx_lng: parentProfile.approx_lng,
         children_info: parentProfile.children_info.trim(),
         emergency_contact: parentProfile.emergency_contact.trim(),
         updated_at: new Date(),
       };
       const { error } = await supabase.from("parent_profiles").upsert(updates);
       if (error) throw error;
-      setParentProfile((prev) => ({ ...prev, address: finalAddress }));
+      setParentProfile((prev) => ({
+        ...prev,
+        address: finalAddress,
+        address_detail: cleanDetail,
+        commune: cleanCommune || "",
+      }));
       setProfileSaveSuccess(true);
       setTimeout(() => setProfileSaveSuccess(false), 3000);
     } catch (error: any) {
@@ -1518,6 +1652,7 @@ export default function ParentHomeScreen() {
         style={{ flex: 1 }}
         contentContainerStyle={styles.container}
         stickyHeaderIndices={[2]}
+        keyboardShouldPersistTaps="handled"
       >
         <View style={styles.headerContainer}>
           <View style={{ flex: 1 }}>
@@ -1993,7 +2128,12 @@ export default function ParentHomeScreen() {
                                 "Servicio de Niñera: " + sitter.first_name,
                                 reqData?.job_date,
                                 reqData?.job_time,
-                                parentProfile.address,
+                                [
+                                  parentProfile.address,
+                                  parentProfile.address_detail,
+                                ]
+                                  .filter(Boolean)
+                                  .join(", "),
                               )
                             }
                           >
@@ -2373,42 +2513,59 @@ export default function ParentHomeScreen() {
               />
 
               <Text style={styles.inputLabel}>
-                Comuna (visible al solicitar)
+                Dirección principal (calle y número, sin depto)
               </Text>
-              <View style={styles.communeChipsContainer}>
-                {PARENT_COMMUNES.map((commune) => {
-                  const isSelected = selectedParentCommune === commune;
-                  return (
-                    <TouchableOpacity
-                      key={commune}
-                      style={[
-                        styles.communeChip,
-                        isSelected && styles.communeChipSelected,
-                      ]}
-                      onPress={() => setSelectedParentCommune(commune)}
-                    >
-                      <Text
-                        style={[
-                          styles.communeChipText,
-                          isSelected && styles.communeChipTextSelected,
-                        ]}
-                      >
-                        {commune}
-                      </Text>
-                    </TouchableOpacity>
-                  );
-                })}
-              </View>
+              <AddressAutocompleteInput
+                value={parentProfile.address}
+                commune={effectiveCommune}
+                isVerified={isAddressVerified}
+                placeholder="Ej: Av. Las Condes 9000"
+                onChangeText={handleAddressTextChange}
+                onSelectPlace={handleSelectResolvedPlace}
+                onClear={handleClearAddress}
+              />
+
+              {shouldShowManualCommuneChips && (
+                <>
+                  <Text style={styles.inputLabel}>
+                    Comuna (visible al solicitar — respaldo manual)
+                  </Text>
+                  <View style={styles.communeChipsContainer}>
+                    {PARENT_COMMUNES.map((commune) => {
+                      const isSelected = selectedParentCommune === commune;
+                      return (
+                        <TouchableOpacity
+                          key={commune}
+                          style={[
+                            styles.communeChip,
+                            isSelected && styles.communeChipSelected,
+                          ]}
+                          onPress={() => setSelectedParentCommune(commune)}
+                        >
+                          <Text
+                            style={[
+                              styles.communeChipText,
+                              isSelected && styles.communeChipTextSelected,
+                            ]}
+                          >
+                            {commune}
+                          </Text>
+                        </TouchableOpacity>
+                      );
+                    })}
+                  </View>
+                </>
+              )}
 
               <Text style={styles.inputLabel}>
-                Dirección exacta (protegida hasta confirmar)
+                Depto / Casa / Block / Referencia (Opcional)
               </Text>
               <TextInput
                 style={styles.input}
-                placeholder="Ej: Av. Las Condes 9000, Depto 402"
-                value={parentProfile.address}
+                placeholder="Ej: Depto 402, Torre B, tocar citófono 402"
+                value={parentProfile.address_detail}
                 onChangeText={(text) =>
-                  setParentProfile({ ...parentProfile, address: text })
+                  setParentProfile({ ...parentProfile, address_detail: text })
                 }
               />
 
@@ -2674,7 +2831,7 @@ export default function ParentHomeScreen() {
         </Modal>
       )}
 
-      {/* MODAL GATEKEEPER JUST-IN-TIME DE DATOS MÍNIMOS (ÍTEM #22 FASE 1 & 2) */}
+      {/* MODAL GATEKEEPER JUST-IN-TIME DE DATOS MÍNIMOS (ÍTEM #22 & #28) */}
       {showOnboardingGateModal && (
         <Modal
           visible={showOnboardingGateModal}
@@ -2684,7 +2841,10 @@ export default function ParentHomeScreen() {
         >
           <View style={styles.modalOverlay}>
             <View style={styles.modalContent}>
-              <ScrollView showsVerticalScrollIndicator={false}>
+              <ScrollView
+                showsVerticalScrollIndicator={false}
+                keyboardShouldPersistTaps="handled"
+              >
                 <Text style={styles.modalName}>
                   📍 ¡Último paso para tu solicitud!
                 </Text>
@@ -2717,42 +2877,59 @@ export default function ParentHomeScreen() {
                 </View>
 
                 <Text style={styles.inputLabel}>
-                  1. ¿En qué comuna es el cuidado? *
+                  1. Dirección (calle y número, sin depto) *
                 </Text>
-                <View style={styles.communeChipsContainer}>
-                  {PARENT_COMMUNES.map((commune) => {
-                    const isSelected = selectedParentCommune === commune;
-                    return (
-                      <TouchableOpacity
-                        key={commune}
-                        style={[
-                          styles.communeChip,
-                          isSelected && styles.communeChipSelected,
-                        ]}
-                        onPress={() => setSelectedParentCommune(commune)}
-                      >
-                        <Text
-                          style={[
-                            styles.communeChipText,
-                            isSelected && styles.communeChipTextSelected,
-                          ]}
-                        >
-                          {commune}
-                        </Text>
-                      </TouchableOpacity>
-                    );
-                  })}
-                </View>
+                <AddressAutocompleteInput
+                  value={parentProfile.address}
+                  commune={effectiveCommune}
+                  isVerified={isAddressVerified}
+                  placeholder="Ej: Av. Las Condes 9000"
+                  onChangeText={handleAddressTextChange}
+                  onSelectPlace={handleSelectResolvedPlace}
+                  onClear={handleClearAddress}
+                />
+
+                {shouldShowManualCommuneChips && (
+                  <>
+                    <Text style={styles.inputLabel}>
+                      Comuna (si escribiste manualmente) *
+                    </Text>
+                    <View style={styles.communeChipsContainer}>
+                      {PARENT_COMMUNES.map((commune) => {
+                        const isSelected = selectedParentCommune === commune;
+                        return (
+                          <TouchableOpacity
+                            key={commune}
+                            style={[
+                              styles.communeChip,
+                              isSelected && styles.communeChipSelected,
+                            ]}
+                            onPress={() => setSelectedParentCommune(commune)}
+                          >
+                            <Text
+                              style={[
+                                styles.communeChipText,
+                                isSelected && styles.communeChipTextSelected,
+                              ]}
+                            >
+                              {commune}
+                            </Text>
+                          </TouchableOpacity>
+                        );
+                      })}
+                    </View>
+                  </>
+                )}
 
                 <Text style={styles.inputLabel}>
-                  2. Dirección exacta (protegida hasta confirmar) *
+                  2. Depto / Casa / Referencia (Opcional)
                 </Text>
                 <TextInput
                   style={styles.input}
-                  placeholder="Ej: Av. Las Condes 9000, Depto 402"
-                  value={parentProfile.address}
+                  placeholder="Ej: Depto 402, Torre B, citófono 402"
+                  value={parentProfile.address_detail}
                   onChangeText={(text) =>
-                    setParentProfile({ ...parentProfile, address: text })
+                    setParentProfile({ ...parentProfile, address_detail: text })
                   }
                 />
 
