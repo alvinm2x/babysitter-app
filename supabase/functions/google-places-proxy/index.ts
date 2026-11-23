@@ -15,7 +15,9 @@ const extractComponent = (
   components: Array<{ longText?: string; shortText?: string; types?: string[] }>,
   type: string,
 ) => {
-  const found = components.find((c) => Array.isArray(c.types) && c.types.includes(type));
+  const found = components.find(
+    (c) => Array.isArray(c.types) && c.types.includes(type),
+  );
   return found?.longText?.trim() || "";
 };
 
@@ -45,6 +47,37 @@ const computeApproxCoords = (lat: number, lng: number) => {
     approxLat: Number((lat + dLat).toFixed(6)),
     approxLng: Number((lng + dLng).toFixed(6)),
   };
+};
+
+const buildCirclePathPoints = (
+  centerLat: number,
+  centerLng: number,
+  radiusMeters: number,
+  steps = 36,
+) => {
+  const points: string[] = [];
+  const cosLat = Math.cos((centerLat * Math.PI) / 180);
+
+  for (let i = 0; i <= steps; i++) {
+    const angle = (i / steps) * 2 * Math.PI;
+    const dLat = (radiusMeters * Math.cos(angle)) / 111320;
+    const dLng = (radiusMeters * Math.sin(angle)) / (111320 * cosLat);
+    const pLat = (centerLat + dLat).toFixed(5);
+    const pLng = (centerLng + dLng).toFixed(5);
+    points.push(`${pLat},${pLng}`);
+  }
+  return points.join("|");
+};
+
+const arrayBufferToBase64 = (buffer: ArrayBuffer) => {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  const chunkSize = 8192;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
 };
 
 Deno.serve(async (req) => {
@@ -222,6 +255,60 @@ Deno.serve(async (req) => {
         lng,
         approxLat: approx.approxLat,
         approxLng: approx.approxLng,
+      });
+    }
+
+    if (action === "static_map") {
+      const approxLat = Number(payload?.approxLat);
+      const approxLng = Number(payload?.approxLng);
+      const rawRadius = Number(payload?.radiusMeters) || 600;
+      const radiusMeters = Math.min(1200, Math.max(300, rawRadius));
+
+      if (!Number.isFinite(approxLat) || !Number.isFinite(approxLng)) {
+        return jsonResponse(
+          { error: "Coordenadas aproximadas inválidas." },
+          400,
+        );
+      }
+
+      const circlePoints = buildCirclePathPoints(
+        approxLat,
+        approxLng,
+        radiusMeters,
+        36,
+      );
+      const pathParam = `fillcolor:0x3182CE38|color:0x3182CECC|weight:2|${circlePoints}`;
+
+      const params = new URLSearchParams({
+        center: `${approxLat.toFixed(6)},${approxLng.toFixed(6)}`,
+        zoom: "14",
+        size: "600x260",
+        scale: "2",
+        maptype: "roadmap",
+        language: "es",
+        region: "CL",
+        path: pathParam,
+        key: apiKey,
+      });
+
+      const staticUrl = `https://maps.googleapis.com/maps/api/staticmap?${params.toString()}`;
+      const mapRes = await fetch(staticUrl);
+
+      if (!mapRes.ok) {
+        const errText = await mapRes.text().catch(() => "");
+        console.error("Maps Static API error:", mapRes.status, errText);
+        return jsonResponse(
+          { error: "No se pudo generar el mapa aproximado desde Google Maps." },
+          502,
+        );
+      }
+
+      const contentType = mapRes.headers.get("content-type") || "image/png";
+      const buffer = await mapRes.arrayBuffer();
+      const base64 = arrayBufferToBase64(buffer);
+
+      return jsonResponse({
+        imageDataUrl: `data:${contentType};base64,${base64}`,
       });
     }
 

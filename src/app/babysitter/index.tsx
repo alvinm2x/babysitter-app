@@ -1,3 +1,4 @@
+import ApproxLocationMap from "@/components/ApproxLocationMap";
 import { supabase } from "@/utils/supabase";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { useEffect, useRef, useState } from "react";
@@ -137,6 +138,21 @@ const hasValidCoords = (info: any) => {
   );
 };
 
+const hasValidApproxCoords = (info: any) => {
+  const lat = Number(info?.approx_lat);
+  const lng = Number(info?.approx_lng);
+  return (
+    info?.approx_lat !== null &&
+    info?.approx_lat !== undefined &&
+    info?.approx_lng !== null &&
+    info?.approx_lng !== undefined &&
+    !isNaN(lat) &&
+    !isNaN(lng) &&
+    lat !== 0 &&
+    lng !== 0
+  );
+};
+
 const showAlert = (title: string, message: string) => {
   if (Platform.OS === "web") {
     alert(title + ": " + message);
@@ -249,6 +265,9 @@ export default function BabysitterHomeScreen() {
   const [requests, setRequests] = useState<any[]>([]);
   const [updatingId, setUpdatingId] = useState<string | null>(null);
   const [copiedAddressId, setCopiedAddressId] = useState<string | null>(null);
+  const [expandedApproxMapIds, setExpandedApproxMapIds] = useState<{
+    [key: string]: boolean;
+  }>({});
   const [loadingProfile, setLoadingProfile] = useState(false);
   const [savingProfile, setSavingProfile] = useState(false);
 
@@ -295,6 +314,10 @@ export default function BabysitterHomeScreen() {
 
   const toggleBreakdown = (id: string) => {
     setExpandedBreakdownIds((prev) => ({ ...prev, [id]: !prev[id] }));
+  };
+
+  const toggleApproxMap = (id: string) => {
+    setExpandedApproxMapIds((prev) => ({ ...prev, [id]: !prev[id] }));
   };
 
   useEffect(() => {
@@ -1525,6 +1548,9 @@ export default function BabysitterHomeScreen() {
                   const isUpdatingThis = updatingId === req.id;
                   const isHighlighted = highlightedRequestId === String(req.id);
                   const isCopied = copiedAddressId === String(req.id);
+                  const isApproxMapOpen = Boolean(
+                    expandedApproxMapIds[String(req.id)],
+                  );
                   const unreadInfo = unreadMap[String(req.id)] || {
                     count: 0,
                     hasSupport: false,
@@ -1536,7 +1562,7 @@ export default function BabysitterHomeScreen() {
                   const parentDisplayName = parentInfo.parent_name || "Familia";
                   const isAccepted = statusNormalized === "accepted";
 
-                  // PRIVACIDAD ESCALONADA (#22 FASE 2)
+                  // PRIVACIDAD ESCALONADA (#22 & #28)
                   const exactLocationUnlocked = isLocationUnlocked(
                     req.status,
                     req.payment_status,
@@ -1551,6 +1577,8 @@ export default function BabysitterHomeScreen() {
                     hasValidCoords(parentInfo) ||
                     String(parentInfo.address || "").trim(),
                   );
+                  const canShowApproxMap =
+                    !exactLocationUnlocked && hasValidApproxCoords(parentInfo);
 
                   const reqHours = getHoursFromTimeRange(req.job_time);
                   const myRate = Number(hourlyRate.replace(/\D/g, "")) || 10000;
@@ -1640,6 +1668,31 @@ export default function BabysitterHomeScreen() {
                             el WhatsApp se desbloquean automáticamente al
                             confirmar la reserva con pago protegido.
                           </Text>
+
+                          {/* MAPA RADIO APROXIMADO BAJO DEMANDA (#28 PASO 5) */}
+                          {canShowApproxMap && (
+                            <View style={styles.approxMapSection}>
+                              <TouchableOpacity
+                                style={styles.approxMapToggleBtn}
+                                onPress={() => toggleApproxMap(String(req.id))}
+                              >
+                                <Text style={styles.approxMapToggleText}>
+                                  {isApproxMapOpen
+                                    ? "🗺️ Ocultar sector aproximado ▲"
+                                    : "🗺️ Ver sector aproximado (~600 m) ▼"}
+                                </Text>
+                              </TouchableOpacity>
+
+                              {isApproxMapOpen && (
+                                <ApproxLocationMap
+                                  approxLat={Number(parentInfo.approx_lat)}
+                                  approxLng={Number(parentInfo.approx_lng)}
+                                  commune={approximateZone}
+                                  radiusMeters={600}
+                                />
+                              )}
+                            </View>
+                          )}
                         </View>
                       )}
 
@@ -2911,6 +2964,23 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: "#744210",
     lineHeight: 16,
+  },
+  approxMapSection: {
+    marginTop: 10,
+  },
+  approxMapToggleBtn: {
+    backgroundColor: "#ebf8ff",
+    borderWidth: 1,
+    borderColor: "#90cdf4",
+    borderRadius: 8,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    alignItems: "center",
+  },
+  approxMapToggleText: {
+    fontSize: 13,
+    fontWeight: "bold",
+    color: "#2b6cb0",
   },
 
   breakdownToggleBtn: {
