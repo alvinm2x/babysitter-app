@@ -1020,10 +1020,20 @@ export default function ParentHomeScreen() {
       const { data, error } = await query;
       if (error) throw error;
 
+      // Alineado 100% con criterio "Operativa" de Torre de Control (#30 Fase 1)
       const validSitters = (data || []).filter((s) => {
         const hasMinRate = Number(s.hourly_rate) >= 10000;
-        const hasName = Boolean(s.first_name && s.first_name.trim());
-        return hasMinRate && hasName;
+        const hasFullName = Boolean(
+          s.first_name?.trim() && s.last_name?.trim(),
+        );
+        const hasPhone = String(s.phone || "").replace(/\D/g, "").length >= 8;
+        const hasBio = Boolean(s.bio && String(s.bio).trim());
+        const hasZone = Boolean(
+          Array.isArray(s.location_zone)
+            ? s.location_zone.length > 0
+            : String(s.location_zone || "").trim(),
+        );
+        return hasMinRate && hasFullName && hasPhone && hasBio && hasZone;
       });
 
       setBabysitters(validSitters);

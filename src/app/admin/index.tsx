@@ -16,6 +16,13 @@ import {
 } from "react-native";
 
 const PLATFORM_COMMISSION_RATE = 0.3;
+const COVERAGE_ZONES = [
+  "Las Condes",
+  "Providencia",
+  "Vitacura",
+  "Santiago Centro",
+];
+const COVERAGE_SHIFTS = ["Mañana", "Tarde", "Noche"];
 
 const showAlert = (title: string, message: string) => {
   if (Platform.OS === "web") {
@@ -73,8 +80,99 @@ const formatMsgTime = (iso?: string) => {
   }
 };
 
+const formatShortDate = (iso?: string | null) => {
+  if (!iso) return "";
+  try {
+    return new Date(iso).toLocaleDateString("es-CL", {
+      day: "2-digit",
+      month: "2-digit",
+      year: "numeric",
+    });
+  } catch {
+    return "";
+  }
+};
+
 const stripSupportPrefix = (content?: string) => {
   return String(content || "").replace(/^\[Soporte[^\]]*\]:\s*/i, "");
+};
+
+const normalizeText = (text: string) =>
+  String(text || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+
+const parseZonesList = (rawZones: any): string[] => {
+  if (Array.isArray(rawZones)) {
+    return rawZones.map((z) => String(z || "").trim()).filter(Boolean);
+  }
+  if (typeof rawZones === "string") {
+    return rawZones
+      .split(",")
+      .map((z) => z.trim())
+      .filter(Boolean);
+  }
+  return [];
+};
+
+const evaluateBabysitterReadiness = (sitterRow: any, masterRow?: any) => {
+  const firstName = String(sitterRow?.first_name || "").trim();
+  const lastName = String(sitterRow?.last_name || "").trim();
+  const fallbackFullName = String(masterRow?.full_name || "").trim();
+  const displayName =
+    [firstName, lastName].filter(Boolean).join(" ") ||
+    fallbackFullName ||
+    "Sin nombre";
+  const displayFirstName =
+    firstName || fallbackFullName.split(" ")[0] || "Hola";
+
+  const phone = String(sitterRow?.phone || "").trim();
+  const hasValidPhone = phone.replace(/\D/g, "").length >= 8;
+  const bio = String(sitterRow?.bio || "").trim();
+  const hourlyRate = Number(sitterRow?.hourly_rate) || 0;
+  const zones = parseZonesList(sitterRow?.location_zone);
+  const days: string[] = Array.isArray(sitterRow?.available_days)
+    ? sitterRow.available_days.filter(Boolean)
+    : [];
+  const shifts: string[] = Array.isArray(sitterRow?.available_shifts)
+    ? sitterRow.available_shifts.filter(Boolean)
+    : [];
+
+  const missingFields: string[] = [];
+  if (!firstName || !lastName) missingFields.push("Nombre y apellido");
+  if (!hasValidPhone) missingFields.push("WhatsApp");
+  if (!bio) missingFields.push("Biografía");
+  if (hourlyRate < 10000) missingFields.push("Tarifa (mín. $10.000)");
+  if (zones.length === 0) missingFields.push("Comunas");
+  if (days.length === 0) missingFields.push("Días disponibles");
+  if (shifts.length === 0) missingFields.push("Bloques horarios");
+
+  const isOperational = missingFields.length === 0;
+
+  return {
+    id: String(sitterRow?.id || masterRow?.id || ""),
+    displayName,
+    displayFirstName,
+    phone,
+    hasValidPhone,
+    bio,
+    hourlyRate,
+    experienceYears: Number(sitterRow?.experience_years) || 0,
+    rating: sitterRow?.rating ? Number(sitterRow.rating) : null,
+    reviewsCount: Number(sitterRow?.reviews_count) || 0,
+    zones,
+    days,
+    shifts,
+    isOperational,
+    missingFields,
+    isAdminAccount: Boolean(masterRow?.is_admin),
+    updatedAt:
+      sitterRow?.updated_at ||
+      sitterRow?.created_at ||
+      masterRow?.created_at ||
+      null,
+  };
 };
 
 const getRequestFinancials = (req: any) => {
@@ -320,9 +418,12 @@ export default function AdminDashboardScreen() {
     null,
   );
 
-  const [activeTab, setActiveTab] = useState<"alerts" | "finance">("alerts");
+  const [activeTab, setActiveTab] = useState<
+    "alerts" | "babysitters" | "finance"
+  >("alerts");
   const [loading, setLoading] = useState(true);
   const [requests, setRequests] = useState<any[]>([]);
+  const [babysittersDirectory, setBabysittersDirectory] = useState<any[]>([]);
   const [msgCountsMap, setMsgCountsMap] = useState<{ [key: string]: number }>(
     {},
   );
@@ -333,6 +434,15 @@ export default function AdminDashboardScreen() {
   const [emailStatusMap, setEmailStatusMap] = useState<{
     [key: string]: string;
   }>({});
+
+  // FILTROS DEL MÓDULO DE OFERTA Y DIRECTORIO DE NIÑERAS (ÍTEM #30 FASE 1)
+  const [sitterStatusFilter, setSitterStatusFilter] = useState<
+    "all" | "operational" | "incomplete"
+  >("all");
+  const [sitterZoneFilter, setSitterZoneFilter] = useState<string>("Todas");
+  const [sitterSearchQuery, setSitterSearchQuery] = useState<string>("");
+  const [hideAdminTestAccounts, setHideAdminTestAccounts] =
+    useState<boolean>(false);
 
   const [expandedBreakdownIds, setExpandedBreakdownIds] = useState<{
     [key: string]: boolean;
@@ -847,33 +957,116 @@ export default function AdminDashboardScreen() {
   const fetchAdminData = async () => {
     setLoading(true);
     try {
-      const { data: reqs, error: reqError } = await supabase
-        .from("job_requests")
-        .select("*")
-        .order("created_at", { ascending: false });
+      // Cargar solicitudes + directorio completo de niñeras en paralelo (#30 Fase 1)
+      const [reqsRes, allSittersRes, sitterMasterRes] = await Promise.all([
+        supabase
+          .from("job_requests")
+          .select("*")
+          .order("created_at", { ascending: false }),
+        supabase.from("babysitter_profiles").select("*"),
+        supabase.from("profiles").select("*").eq("role", "babysitter"),
+      ]);
 
-      if (reqError) throw reqError;
-      if (!reqs || reqs.length === 0) {
+      if (reqsRes.error) throw reqsRes.error;
+      const reqs = reqsRes.data || [];
+
+      const allSittersList = allSittersRes.data || [];
+      const sitterProfileMap: { [id: string]: any } = {};
+      allSittersList.forEach((b: any) => {
+        if (b?.id) sitterProfileMap[String(b.id)] = b;
+      });
+
+      const sitterMasterMap: { [id: string]: any } = {};
+      (sitterMasterRes.data || []).forEach((mp: any) => {
+        if (mp?.id) sitterMasterMap[String(mp.id)] = mp;
+      });
+
+      // Buscar perfiles maestros faltantes para niñeras que tienen fila en babysitter_profiles (ej: super-admins)
+      const missingMasterIds = Object.keys(sitterProfileMap).filter(
+        (id) => !sitterMasterMap[id],
+      );
+      if (missingMasterIds.length > 0) {
+        const { data: extraMasters } = await supabase
+          .from("profiles")
+          .select("*")
+          .in("id", missingMasterIds);
+        extraMasters?.forEach((mp: any) => {
+          if (mp?.id) sitterMasterMap[String(mp.id)] = mp;
+        });
+      }
+
+      // Contabilizar turnos activos y completados por niñera
+      const sitterStatsMap: {
+        [id: string]: { active: number; completed: number; earnedNet: number };
+      } = {};
+      reqs.forEach((r: any) => {
+        const sid = String(r.babysitter_id || "");
+        if (!sid) return;
+        if (!sitterStatsMap[sid]) {
+          sitterStatsMap[sid] = { active: 0, completed: 0, earnedNet: 0 };
+        }
+        if (r.status === "pending" || r.status === "accepted") {
+          sitterStatsMap[sid].active += 1;
+        } else if (r.status === "completed") {
+          sitterStatsMap[sid].completed += 1;
+          sitterStatsMap[sid].earnedNet += getRequestFinancials(r).payout;
+        }
+      });
+
+      const allSitterIds = Array.from(
+        new Set([
+          ...Object.keys(sitterProfileMap),
+          ...Object.keys(sitterMasterMap),
+        ]),
+      );
+
+      const directory = allSitterIds
+        .map((id) => {
+          const evaluated = evaluateBabysitterReadiness(
+            sitterProfileMap[id],
+            sitterMasterMap[id],
+          );
+          const stats = sitterStatsMap[id] || {
+            active: 0,
+            completed: 0,
+            earnedNet: 0,
+          };
+          return {
+            ...evaluated,
+            activeJobsCount: stats.active,
+            completedJobsCount: stats.completed,
+            earnedNet: stats.earnedNet,
+          };
+        })
+        .sort((a, b) => {
+          // Primero operativas, luego por más turnos completados y nombre
+          if (a.isOperational !== b.isOperational) {
+            return a.isOperational ? -1 : 1;
+          }
+          if (a.completedJobsCount !== b.completedJobsCount) {
+            return b.completedJobsCount - a.completedJobsCount;
+          }
+          return a.displayName.localeCompare(b.displayName, "es");
+        });
+
+      setBabysittersDirectory(directory);
+
+      if (reqs.length === 0) {
         trackedRequestIdsRef.current = [];
         setRequests([]);
         setMsgCountsMap({});
         setUnreadCountsMap({});
-        setLoading(false);
         return;
       }
 
-      const reqIds = reqs.map((r) => String(r.id)).filter(Boolean);
+      const reqIds = reqs.map((r: any) => String(r.id)).filter(Boolean);
       trackedRequestIdsRef.current = reqIds;
 
       const parentIds = Array.from(
-        new Set(reqs.map((r) => r.parent_id).filter(Boolean)),
-      );
-      const babysitterIds = Array.from(
-        new Set(reqs.map((r) => r.babysitter_id).filter(Boolean)),
+        new Set(reqs.map((r: any) => r.parent_id).filter(Boolean)),
       );
 
       let parentsMap: { [key: string]: any } = {};
-      let babysittersMap: { [key: string]: any } = {};
       let nameMap: { [key: string]: string } = {};
       const counts: { [key: string]: number } = {};
       const unreadCounts: { [key: string]: number } = {};
@@ -926,36 +1119,23 @@ export default function AdminDashboardScreen() {
       }
 
       if (parentIds.length > 0) {
-        const { data: parents } = await supabase
-          .from("parent_profiles")
-          .select("*")
-          .in("id", parentIds);
-        parents?.forEach((p) => (parentsMap[p.id] = p));
-
-        const { data: masterParents } = await supabase
-          .from("profiles")
-          .select("id, full_name")
-          .in("id", parentIds);
-        masterParents?.forEach((mp) => {
+        const [parentsRes, masterParentsRes] = await Promise.all([
+          supabase.from("parent_profiles").select("*").in("id", parentIds),
+          supabase.from("profiles").select("id, full_name").in("id", parentIds),
+        ]);
+        parentsRes.data?.forEach((p: any) => (parentsMap[p.id] = p));
+        masterParentsRes.data?.forEach((mp: any) => {
           if (mp.full_name) nameMap[mp.id] = mp.full_name;
         });
       }
 
-      if (babysitterIds.length > 0) {
-        const { data: babysitters } = await supabase
-          .from("babysitter_profiles")
-          .select("*")
-          .in("id", babysitterIds);
-        babysitters?.forEach((b) => (babysittersMap[b.id] = b));
-      }
-
-      const combined = reqs.map((r) => ({
+      const combined = reqs.map((r: any) => ({
         ...r,
         parent: {
           ...(parentsMap[r.parent_id] || {}),
           parent_name: nameMap[r.parent_id] || "Familia",
         },
-        babysitter: babysittersMap[r.babysitter_id] || {},
+        babysitter: sitterProfileMap[String(r.babysitter_id)] || {},
       }));
 
       setMsgCountsMap(counts);
@@ -1336,6 +1516,63 @@ export default function AdminDashboardScreen() {
 
   const completedRequests = requests.filter((r) => r.status === "completed");
 
+  // MÉTRICAS DE OFERTA Y DIRECTORIO DE NIÑERAS (#30 FASE 1)
+  const scopedSitters = hideAdminTestAccounts
+    ? babysittersDirectory.filter((s) => !s.isAdminAccount)
+    : babysittersDirectory;
+
+  const operationalSitters = scopedSitters.filter((s) => s.isOperational);
+  const incompleteSitters = scopedSitters.filter((s) => !s.isOperational);
+  const activationRate =
+    scopedSitters.length > 0
+      ? Math.round((operationalSitters.length / scopedSitters.length) * 100)
+      : 0;
+  const adminTestAccountsCount = babysittersDirectory.filter(
+    (s) => s.isAdminAccount,
+  ).length;
+
+  const zoneCoverage = COVERAGE_ZONES.map((zone) => {
+    const count = operationalSitters.filter((s) =>
+      s.zones.some((z: string) =>
+        normalizeText(z).includes(normalizeText(zone)),
+      ),
+    ).length;
+    return { zone, count };
+  });
+
+  const shiftCoverage = COVERAGE_SHIFTS.map((shift) => {
+    const count = operationalSitters.filter((s) =>
+      s.shifts.some((sh: string) => normalizeText(sh) === normalizeText(shift)),
+    ).length;
+    return { shift, count };
+  });
+
+  const weekendCoverage = ["Sábado", "Domingo"].map((day) => {
+    const count = operationalSitters.filter((s) =>
+      s.days.some((d: string) => normalizeText(d) === normalizeText(day)),
+    ).length;
+    return { day: day.slice(0, 3), count };
+  });
+
+  const filteredSitters = scopedSitters.filter((s) => {
+    if (sitterStatusFilter === "operational" && !s.isOperational) return false;
+    if (sitterStatusFilter === "incomplete" && s.isOperational) return false;
+    if (sitterZoneFilter !== "Todas") {
+      const matchesZone = s.zones.some((z: string) =>
+        normalizeText(z).includes(normalizeText(sitterZoneFilter)),
+      );
+      if (!matchesZone) return false;
+    }
+    if (sitterSearchQuery.trim()) {
+      const q = normalizeText(sitterSearchQuery.trim());
+      const haystack = normalizeText(
+        `${s.displayName} ${s.phone} ${s.zones.join(" ")}`,
+      );
+      if (!haystack.includes(q)) return false;
+    }
+    return true;
+  });
+
   // CONTABILIDAD LIMPIA (#27): Escrow estricto (accepted + held) sin duplicar unpaid
   const unpaidAcceptedRequests = requests.filter(
     (r) => r.status === "accepted" && r.payment_status === "unpaid",
@@ -1391,8 +1628,23 @@ export default function AdminDashboardScreen() {
     <View style={styles.mainWrapper}>
       <ScrollView style={{ flex: 1 }} contentContainerStyle={styles.container}>
         <View style={styles.headerContainer}>
-          <Text style={styles.title}>Torre de Control 🗼</Text>
-          <Text style={styles.subtitle}>Gestión Proactiva y Finanzas</Text>
+          <View style={styles.headerTitleRow}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.title}>Torre de Control 🗼</Text>
+              <Text style={styles.subtitle}>
+                Operación, Oferta de Niñeras y Finanzas
+              </Text>
+            </View>
+            <TouchableOpacity
+              style={styles.refreshBtn}
+              onPress={fetchAdminData}
+              disabled={loading}
+            >
+              <Text style={styles.refreshBtnText}>
+                {loading ? "⏳" : "🔄 Actualizar"}
+              </Text>
+            </TouchableOpacity>
+          </View>
         </View>
 
         <View style={styles.tabContainer}>
@@ -1406,9 +1658,27 @@ export default function AdminDashboardScreen() {
                 activeTab === "alerts" && styles.activeTabText,
               ]}
             >
-              🔥 Alertas de Operación ({sortedAlertCards.length})
+              🔥 Alertas ({sortedAlertCards.length})
             </Text>
           </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[
+              styles.tab,
+              activeTab === "babysitters" && styles.activeTab,
+            ]}
+            onPress={() => setActiveTab("babysitters")}
+          >
+            <Text
+              style={[
+                styles.tabText,
+                activeTab === "babysitters" && styles.activeTabText,
+              ]}
+            >
+              👩‍🍼 Niñeras ({operationalSitters.length}/{scopedSitters.length})
+            </Text>
+          </TouchableOpacity>
+
           <TouchableOpacity
             style={[styles.tab, activeTab === "finance" && styles.activeTab]}
             onPress={() => setActiveTab("finance")}
@@ -1419,7 +1689,7 @@ export default function AdminDashboardScreen() {
                 activeTab === "finance" && styles.activeTabText,
               ]}
             >
-              💰 Tesorería y Payouts
+              💰 Tesorería
             </Text>
           </TouchableOpacity>
         </View>
@@ -1535,6 +1805,415 @@ export default function AdminDashboardScreen() {
                     </View>
                   );
                 })}
+              </View>
+            )}
+
+            {/* NUEVA PESTAÑA: OFERTA Y DIRECTORIO DE NIÑERAS (ÍTEM #30 FASE 1) */}
+            {activeTab === "babysitters" && (
+              <View style={styles.listContainer}>
+                {/* KPIs DE SALUD DE OFERTA */}
+                <View style={styles.supplyKpiRow}>
+                  <TouchableOpacity
+                    style={[
+                      styles.supplyKpiCard,
+                      styles.supplyKpiOperational,
+                      sitterStatusFilter === "operational" &&
+                        styles.supplyKpiSelected,
+                    ]}
+                    onPress={() =>
+                      setSitterStatusFilter((prev) =>
+                        prev === "operational" ? "all" : "operational",
+                      )
+                    }
+                  >
+                    <Text style={styles.supplyKpiLabel}>🟢 Operativas</Text>
+                    <Text style={[styles.supplyKpiValue, { color: "#22543d" }]}>
+                      {operationalSitters.length}
+                    </Text>
+                    <Text style={styles.supplyKpiMicro}>
+                      Listas para turnos
+                    </Text>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    style={[
+                      styles.supplyKpiCard,
+                      styles.supplyKpiIncomplete,
+                      sitterStatusFilter === "incomplete" &&
+                        styles.supplyKpiSelected,
+                    ]}
+                    onPress={() =>
+                      setSitterStatusFilter((prev) =>
+                        prev === "incomplete" ? "all" : "incomplete",
+                      )
+                    }
+                  >
+                    <Text style={styles.supplyKpiLabel}>🟡 Incompletas</Text>
+                    <Text style={[styles.supplyKpiValue, { color: "#9c4221" }]}>
+                      {incompleteSitters.length}
+                    </Text>
+                    <Text style={styles.supplyKpiMicro}>Faltan datos</Text>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    style={[
+                      styles.supplyKpiCard,
+                      styles.supplyKpiTotal,
+                      sitterStatusFilter === "all" && styles.supplyKpiSelected,
+                    ]}
+                    onPress={() => setSitterStatusFilter("all")}
+                  >
+                    <Text style={styles.supplyKpiLabel}>📊 Activación</Text>
+                    <Text style={[styles.supplyKpiValue, { color: "#2b6cb0" }]}>
+                      {activationRate}%
+                    </Text>
+                    <Text style={styles.supplyKpiMicro}>
+                      Total: {scopedSitters.length}
+                    </Text>
+                  </TouchableOpacity>
+                </View>
+
+                {/* TOGGLE PARA EXCLUIR CUENTAS ADMIN / TEST */}
+                {adminTestAccountsCount > 0 && (
+                  <TouchableOpacity
+                    style={[
+                      styles.testFilterBar,
+                      hideAdminTestAccounts && styles.testFilterBarActive,
+                    ]}
+                    onPress={() => setHideAdminTestAccounts((prev) => !prev)}
+                  >
+                    <Text
+                      style={[
+                        styles.testFilterText,
+                        hideAdminTestAccounts && styles.testFilterTextActive,
+                      ]}
+                    >
+                      {hideAdminTestAccounts
+                        ? `✅ Ocultando ${adminTestAccountsCount} cuentas Admin/Test (mostrando solo oferta real)`
+                        : `🧪 Incluyendo ${adminTestAccountsCount} cuentas Admin/Test — Toca para ver solo oferta real`}
+                    </Text>
+                  </TouchableOpacity>
+                )}
+
+                {/* MAPA DE COBERTURA POR COMUNA Y HORARIO (SOLO OPERATIVAS) */}
+                <View style={styles.coverageCard}>
+                  <Text style={styles.coverageTitle}>
+                    🗺️ Cobertura Operativa por Comuna
+                  </Text>
+                  <View style={styles.coverageChipsRow}>
+                    <TouchableOpacity
+                      style={[
+                        styles.coverageChip,
+                        sitterZoneFilter === "Todas" &&
+                          styles.coverageChipActive,
+                      ]}
+                      onPress={() => setSitterZoneFilter("Todas")}
+                    >
+                      <Text
+                        style={[
+                          styles.coverageChipText,
+                          sitterZoneFilter === "Todas" &&
+                            styles.coverageChipTextActive,
+                        ]}
+                      >
+                        🌎 Todas ({operationalSitters.length})
+                      </Text>
+                    </TouchableOpacity>
+
+                    {zoneCoverage.map(({ zone, count }) => {
+                      const isSelected = sitterZoneFilter === zone;
+                      return (
+                        <TouchableOpacity
+                          key={zone}
+                          style={[
+                            styles.coverageChip,
+                            count === 0 && styles.coverageChipEmpty,
+                            isSelected && styles.coverageChipActive,
+                          ]}
+                          onPress={() =>
+                            setSitterZoneFilter((prev) =>
+                              prev === zone ? "Todas" : zone,
+                            )
+                          }
+                        >
+                          <Text
+                            style={[
+                              styles.coverageChipText,
+                              count === 0 && styles.coverageChipTextEmpty,
+                              isSelected && styles.coverageChipTextActive,
+                            ]}
+                          >
+                            {zone} ({count})
+                          </Text>
+                        </TouchableOpacity>
+                      );
+                    })}
+                  </View>
+
+                  <Text style={[styles.coverageTitle, { marginTop: 10 }]}>
+                    ⏰ Bloques y Fines de Semana (Operativas)
+                  </Text>
+                  <View style={styles.coverageChipsRow}>
+                    {shiftCoverage.map(({ shift, count }) => (
+                      <View
+                        key={shift}
+                        style={[
+                          styles.shiftPill,
+                          count === 0 && styles.coverageChipEmpty,
+                        ]}
+                      >
+                        <Text
+                          style={[
+                            styles.shiftPillText,
+                            count === 0 && styles.coverageChipTextEmpty,
+                          ]}
+                        >
+                          {shift}: {count}
+                        </Text>
+                      </View>
+                    ))}
+                    {weekendCoverage.map(({ day, count }) => (
+                      <View
+                        key={day}
+                        style={[
+                          styles.shiftPill,
+                          count === 0 && styles.coverageChipEmpty,
+                        ]}
+                      >
+                        <Text
+                          style={[
+                            styles.shiftPillText,
+                            count === 0 && styles.coverageChipTextEmpty,
+                          ]}
+                        >
+                          {day}: {count}
+                        </Text>
+                      </View>
+                    ))}
+                  </View>
+                </View>
+
+                {/* BUSCADOR Y FILTROS DE DIRECTORIO */}
+                <View style={styles.directoryFiltersBox}>
+                  <TextInput
+                    style={styles.searchInput}
+                    placeholder="🔍 Buscar por nombre, teléfono o comuna..."
+                    placeholderTextColor="#a0aec0"
+                    value={sitterSearchQuery}
+                    onChangeText={setSitterSearchQuery}
+                  />
+
+                  <View style={styles.filterPillsRow}>
+                    {(
+                      [
+                        {
+                          key: "all",
+                          label: `Todas (${scopedSitters.length})`,
+                        },
+                        {
+                          key: "operational",
+                          label: `🟢 Operativas (${operationalSitters.length})`,
+                        },
+                        {
+                          key: "incomplete",
+                          label: `🟡 Incompletas (${incompleteSitters.length})`,
+                        },
+                      ] as const
+                    ).map((opt) => {
+                      const active = sitterStatusFilter === opt.key;
+                      return (
+                        <TouchableOpacity
+                          key={opt.key}
+                          style={[
+                            styles.filterPill,
+                            active && styles.filterPillActive,
+                          ]}
+                          onPress={() => setSitterStatusFilter(opt.key)}
+                        >
+                          <Text
+                            style={[
+                              styles.filterPillText,
+                              active && styles.filterPillTextActive,
+                            ]}
+                          >
+                            {opt.label}
+                          </Text>
+                        </TouchableOpacity>
+                      );
+                    })}
+                  </View>
+                </View>
+
+                {/* LISTADO DE NIÑERAS */}
+                {filteredSitters.length === 0 ? (
+                  <Text style={styles.emptyText}>
+                    No hay niñeras que coincidan con estos filtros.
+                  </Text>
+                ) : (
+                  filteredSitters.map((sitter) => {
+                    const rescueMessage = `¡Hola ${sitter.displayFirstName}! Te escribimos desde MiBabysitter.cl 😊 Vimos que ya creaste tu cuenta, pero aún te falta completar: ${sitter.missingFields.join(", ")} en tu perfil para aparecer a las familias. ¿Te ayudamos a dejarlo listo?`;
+                    const checkMessage = `¡Hola ${sitter.displayFirstName}! Te escribimos desde Soporte MiBabysitter.cl 😊 Queríamos saludarte y confirmar si tus comunas y horarios en la app siguen al día para recibir solicitudes.`;
+
+                    return (
+                      <View
+                        key={sitter.id}
+                        style={[
+                          styles.sitterCard,
+                          sitter.isOperational
+                            ? styles.sitterCardOperational
+                            : styles.sitterCardIncomplete,
+                        ]}
+                      >
+                        <View style={styles.sitterHeaderRow}>
+                          <View style={{ flex: 1, paddingRight: 8 }}>
+                            <View style={styles.sitterNameRow}>
+                              <Text style={styles.sitterName}>
+                                {sitter.displayName}
+                              </Text>
+                              {sitter.isAdminAccount && (
+                                <View style={styles.adminTagPill}>
+                                  <Text style={styles.adminTagText}>
+                                    🧪 Test/Admin
+                                  </Text>
+                                </View>
+                              )}
+                            </View>
+                            <Text style={styles.sitterSubMeta}>
+                              {sitter.hourlyRate >= 10000
+                                ? `${formatCLPCompact(sitter.hourlyRate)}/hr`
+                                : "Sin tarifa"}
+                              {" • "}⭐{" "}
+                              {sitter.rating
+                                ? `${sitter.rating.toFixed(1)} (${sitter.reviewsCount})`
+                                : "Nuevo"}
+                              {" • "}
+                              {sitter.completedJobsCount}{" "}
+                              {sitter.completedJobsCount === 1
+                                ? "turno"
+                                : "turnos"}
+                              {sitter.activeJobsCount > 0
+                                ? ` (${sitter.activeJobsCount} activos)`
+                                : ""}
+                            </Text>
+                          </View>
+
+                          <View
+                            style={[
+                              styles.sitterStatusBadge,
+                              sitter.isOperational
+                                ? styles.sitterStatusOk
+                                : styles.sitterStatusWarn,
+                            ]}
+                          >
+                            <Text
+                              style={[
+                                styles.sitterStatusText,
+                                sitter.isOperational
+                                  ? { color: "#22543d" }
+                                  : { color: "#9c4221" },
+                              ]}
+                            >
+                              {sitter.isOperational
+                                ? "🟢 Operativa"
+                                : "🟡 Incompleta"}
+                            </Text>
+                          </View>
+                        </View>
+
+                        <View style={styles.sitterDetailsBox}>
+                          <Text style={styles.sitterDetailLine}>
+                            📍 Comunas:{" "}
+                            <Text style={{ fontWeight: "600" }}>
+                              {sitter.zones.length > 0
+                                ? sitter.zones.join(", ")
+                                : "No definidas"}
+                            </Text>
+                          </Text>
+                          <Text style={styles.sitterDetailLine}>
+                            📅 Días:{" "}
+                            <Text style={{ fontWeight: "600" }}>
+                              {sitter.days.length > 0
+                                ? sitter.days
+                                    .map((d: string) => d.slice(0, 3))
+                                    .join(", ")
+                                : "Sin días"}
+                            </Text>
+                          </Text>
+                          <Text style={styles.sitterDetailLine}>
+                            ⏰ Horarios:{" "}
+                            <Text style={{ fontWeight: "600" }}>
+                              {sitter.shifts.length > 0
+                                ? sitter.shifts.join(" • ")
+                                : "Sin bloques"}
+                            </Text>
+                          </Text>
+                          <Text style={styles.sitterDetailLine}>
+                            📞 WhatsApp:{" "}
+                            <Text style={{ fontWeight: "600" }}>
+                              {sitter.phone || "No registrado"}
+                            </Text>
+                            {sitter.updatedAt
+                              ? `  •  Act.: ${formatShortDate(sitter.updatedAt)}`
+                              : ""}
+                          </Text>
+                        </View>
+
+                        {!sitter.isOperational && (
+                          <View style={styles.missingFieldsBox}>
+                            <Text style={styles.missingFieldsTitle}>
+                              ⚠️ Pendiente para estar operativa:
+                            </Text>
+                            <View style={styles.missingChipsRow}>
+                              {sitter.missingFields.map((field: string) => (
+                                <View key={field} style={styles.missingChip}>
+                                  <Text style={styles.missingChipText}>
+                                    • {field}
+                                  </Text>
+                                </View>
+                              ))}
+                            </View>
+                          </View>
+                        )}
+
+                        {sitter.hasValidPhone ? (
+                          <TouchableOpacity
+                            style={
+                              sitter.isOperational
+                                ? styles.actionBtnGreen
+                                : styles.actionBtnYellow
+                            }
+                            onPress={() =>
+                              openWhatsApp(
+                                sitter.phone,
+                                sitter.isOperational
+                                  ? checkMessage
+                                  : rescueMessage,
+                              )
+                            }
+                          >
+                            <Text
+                              style={
+                                sitter.isOperational
+                                  ? styles.actionBtnText
+                                  : styles.actionBtnTextDark
+                              }
+                            >
+                              {sitter.isOperational
+                                ? "📲 WhatsApp de Coordinación"
+                                : "📲 WhatsApp — Ayudar a Completar Perfil"}
+                            </Text>
+                          </TouchableOpacity>
+                        ) : (
+                          <View style={styles.actionBtnDisabled}>
+                            <Text style={styles.actionBtnTextDisabled}>
+                              ⚠️ Sin WhatsApp registrado todavía
+                            </Text>
+                          </View>
+                        )}
+                      </View>
+                    );
+                  })
+                )}
               </View>
             )}
 
@@ -2257,6 +2936,12 @@ const styles = StyleSheet.create({
     paddingHorizontal: 24,
     marginBottom: 20,
   },
+  headerTitleRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "flex-start",
+    gap: 12,
+  },
   title: {
     fontSize: 28,
     fontWeight: "bold",
@@ -2264,6 +2949,20 @@ const styles = StyleSheet.create({
     marginBottom: 4,
   },
   subtitle: { fontSize: 15, color: "#718096" },
+  refreshBtn: {
+    backgroundColor: "#ebf8ff",
+    borderWidth: 1,
+    borderColor: "#bee3f8",
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    marginTop: 4,
+  },
+  refreshBtnText: {
+    fontSize: 12,
+    fontWeight: "bold",
+    color: "#2b6cb0",
+  },
 
   tabContainer: {
     flexDirection: "row",
@@ -2275,9 +2974,20 @@ const styles = StyleSheet.create({
     maxWidth: 600,
     alignSelf: "center",
   },
-  tab: { flex: 1, paddingVertical: 10, alignItems: "center", borderRadius: 6 },
+  tab: {
+    flex: 1,
+    paddingVertical: 10,
+    paddingHorizontal: 4,
+    alignItems: "center",
+    borderRadius: 6,
+  },
   activeTab: { backgroundColor: "#fff", elevation: 2 },
-  tabText: { fontSize: 14, fontWeight: "600", color: "#718096" },
+  tabText: {
+    fontSize: 13,
+    fontWeight: "600",
+    color: "#718096",
+    textAlign: "center",
+  },
   activeTabText: { color: "#2b6cb0" },
   contentArea: {
     width: "100%",
@@ -2286,6 +2996,282 @@ const styles = StyleSheet.create({
     paddingHorizontal: 24,
   },
   listContainer: { width: "100%", marginBottom: 32 },
+
+  // ESTILOS DEL MÓDULO DE OFERTA Y DIRECTORIO DE NIÑERAS (#30 FASE 1)
+  supplyKpiRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    gap: 8,
+    marginBottom: 12,
+  },
+  supplyKpiCard: {
+    flex: 1,
+    borderRadius: 12,
+    padding: 12,
+    borderWidth: 1.5,
+    alignItems: "center",
+  },
+  supplyKpiOperational: {
+    backgroundColor: "#f0fff4",
+    borderColor: "#c6f6d5",
+  },
+  supplyKpiIncomplete: {
+    backgroundColor: "#fffaf0",
+    borderColor: "#fbd38d",
+  },
+  supplyKpiTotal: {
+    backgroundColor: "#ebf8ff",
+    borderColor: "#bee3f8",
+  },
+  supplyKpiSelected: {
+    borderColor: "#2b6cb0",
+    borderWidth: 2,
+  },
+  supplyKpiLabel: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#4a5568",
+    marginBottom: 4,
+  },
+  supplyKpiValue: {
+    fontSize: 22,
+    fontWeight: "bold",
+  },
+  supplyKpiMicro: {
+    fontSize: 10.5,
+    color: "#718096",
+    marginTop: 2,
+    textAlign: "center",
+  },
+  testFilterBar: {
+    backgroundColor: "#edf2f7",
+    borderWidth: 1,
+    borderColor: "#cbd5e0",
+    borderRadius: 8,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    marginBottom: 12,
+  },
+  testFilterBarActive: {
+    backgroundColor: "#ebf8ff",
+    borderColor: "#90cdf4",
+  },
+  testFilterText: {
+    fontSize: 12,
+    color: "#4a5568",
+    fontWeight: "600",
+    textAlign: "center",
+  },
+  testFilterTextActive: {
+    color: "#2b6cb0",
+  },
+  coverageCard: {
+    backgroundColor: "#ffffff",
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+    borderRadius: 12,
+    padding: 14,
+    marginBottom: 14,
+  },
+  coverageTitle: {
+    fontSize: 13,
+    fontWeight: "bold",
+    color: "#2d3748",
+    marginBottom: 8,
+  },
+  coverageChipsRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 6,
+  },
+  coverageChip: {
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    borderRadius: 16,
+    backgroundColor: "#ebf8ff",
+    borderWidth: 1,
+    borderColor: "#bee3f8",
+  },
+  coverageChipEmpty: {
+    backgroundColor: "#fff5f5",
+    borderColor: "#fed7d7",
+  },
+  coverageChipActive: {
+    backgroundColor: "#3182ce",
+    borderColor: "#2b6cb0",
+  },
+  coverageChipText: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: "#2b6cb0",
+  },
+  coverageChipTextEmpty: {
+    color: "#c53030",
+  },
+  coverageChipTextActive: {
+    color: "#ffffff",
+  },
+  shiftPill: {
+    paddingVertical: 4,
+    paddingHorizontal: 10,
+    borderRadius: 12,
+    backgroundColor: "#edf2f7",
+    borderWidth: 1,
+    borderColor: "#cbd5e0",
+  },
+  shiftPillText: {
+    fontSize: 11.5,
+    fontWeight: "600",
+    color: "#4a5568",
+  },
+  directoryFiltersBox: {
+    marginBottom: 14,
+    gap: 8,
+  },
+  searchInput: {
+    backgroundColor: "#ffffff",
+    borderWidth: 1,
+    borderColor: "#cbd5e0",
+    borderRadius: 10,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    fontSize: 14,
+    color: "#2d3748",
+  },
+  filterPillsRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 6,
+  },
+  filterPill: {
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    borderRadius: 16,
+    backgroundColor: "#edf2f7",
+    borderWidth: 1,
+    borderColor: "#cbd5e0",
+  },
+  filterPillActive: {
+    backgroundColor: "#2b6cb0",
+    borderColor: "#2b6cb0",
+  },
+  filterPillText: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: "#4a5568",
+  },
+  filterPillTextActive: {
+    color: "#ffffff",
+  },
+  sitterCard: {
+    backgroundColor: "#ffffff",
+    borderRadius: 12,
+    padding: 16,
+    marginBottom: 14,
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+    borderLeftWidth: 4,
+  },
+  sitterCardOperational: {
+    borderLeftColor: "#38a169",
+  },
+  sitterCardIncomplete: {
+    borderLeftColor: "#d69e2e",
+  },
+  sitterHeaderRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "flex-start",
+    marginBottom: 10,
+  },
+  sitterNameRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    flexWrap: "wrap",
+    gap: 6,
+    marginBottom: 3,
+  },
+  sitterName: {
+    fontSize: 16,
+    fontWeight: "bold",
+    color: "#1a202c",
+  },
+  adminTagPill: {
+    backgroundColor: "#edf2f7",
+    borderWidth: 1,
+    borderColor: "#cbd5e0",
+    paddingVertical: 2,
+    paddingHorizontal: 6,
+    borderRadius: 8,
+  },
+  adminTagText: {
+    fontSize: 10,
+    fontWeight: "bold",
+    color: "#4a5568",
+  },
+  sitterSubMeta: {
+    fontSize: 12.5,
+    color: "#4a5568",
+    fontWeight: "500",
+  },
+  sitterStatusBadge: {
+    paddingVertical: 4,
+    paddingHorizontal: 9,
+    borderRadius: 12,
+  },
+  sitterStatusOk: {
+    backgroundColor: "#c6f6d5",
+  },
+  sitterStatusWarn: {
+    backgroundColor: "#feebc8",
+  },
+  sitterStatusText: {
+    fontSize: 11.5,
+    fontWeight: "bold",
+  },
+  sitterDetailsBox: {
+    backgroundColor: "#f8fafc",
+    borderWidth: 1,
+    borderColor: "#edf2f7",
+    borderRadius: 8,
+    padding: 10,
+    marginBottom: 10,
+    gap: 3,
+  },
+  sitterDetailLine: {
+    fontSize: 12.5,
+    color: "#4a5568",
+  },
+  missingFieldsBox: {
+    backgroundColor: "#fffaf0",
+    borderWidth: 1,
+    borderColor: "#fbd38d",
+    borderRadius: 8,
+    padding: 10,
+    marginBottom: 10,
+  },
+  missingFieldsTitle: {
+    fontSize: 12,
+    fontWeight: "bold",
+    color: "#9c4221",
+    marginBottom: 6,
+  },
+  missingChipsRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 6,
+  },
+  missingChip: {
+    backgroundColor: "#feebc8",
+    paddingVertical: 3,
+    paddingHorizontal: 8,
+    borderRadius: 10,
+  },
+  missingChipText: {
+    fontSize: 11.5,
+    fontWeight: "600",
+    color: "#744210",
+  },
 
   alertCard: {
     width: "100%",
